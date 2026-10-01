@@ -1,0 +1,226 @@
+"""LLM v4.1: детерминированный скоринг копируется из scores_block, отказ невозможен."""
+from __future__ import annotations
+import json, re
+from pathlib import Path
+import httpx
+
+SCHEMA="""{
+ "summary": "3-5 предложений нарративного заключения",
+ "big_five": {"openness":0,"conscientiousness":0,"extraversion":0,"agreeableness":0,"neuroticism":0,"notes":"..."},
+ "mbti": {"type":"ENFJ","axes":{"E_I":55,"S_N":65,"T_F":40,"J_P":60},"notes":"..."},
+ "enneagram": {"type":3,"wing":"3w2","notes":"..."},
+ "temperament": {"sanguine":0,"choleric":0,"melancholic":0,"phlegmatic":0,"notes":"..."},
+ "hexaco": {"H":0,"E":0,"X":0,"A":0,"C":0,"O":0,"notes":"..."},
+ "pid5": {"negative_affect":0,"detachment":0,"antagonism":0,"disinhibition":0,"psychoticism":0,"notes":"..."},
+ "truthfulness": {"score":0,"verdict":"...","cues":[{"cue":"...","direction":"повышает/понижает доверие"}]},
+ "evidence": {"big_five":[{"episode_id":"P10_00","timecode":"00:12-00:16","rationale":"..."}],
+              "mbti":[],"enneagram":[],"temperament":[],"hexaco":[],"pid5":[],"truthfulness":[]},
+ "confidence": 0.0
+}"""
+
+SYSTEM_PROMPT=(
+ "Ты — эксперт по поведенческой диагностике PersonaScope. Вход: JSON измерений MediaPipe (мимика, поза, руки, взгляд, "
+ "речь, голос), счётчики паттернов P01-P12, список эпизодов с таймкодами, детерминированные скоринги scores_block и формула truth_heuristic.\n"
+ "КОНТРАКТ:\n"
+ "1) Числовые скоринги систем и truthfulness.score вычислены детерминированным модулем (scores_block): скопируй их в поля ответа без изменений.\n"
+ "2) summary и notes = СОДЕРЖАТЕЛЬНАЯ интерпретационная заключительная оценка: какие маркеры (паттерны, каналы, эпизоды) "
+ "поддерживают каждый скор; поведенческие гипотезы причинно-следствия; динамика по видео. Пиши конкретно: счётчики, окна, каналы.\n"
+ "3) evidence: для КАЖДОЙ системы процитируй >=2 эпизода из входного списка (episode_id + timecode + rationale <=20 слов); "
+ "при слабых маркерах цитируй эпизоды, вошедшие в композит. Пустой evidence = нарушение контракта.\n"
+ "4) В summary/notes/verdict ЗАПРЕЩЕНЫ: рассуждения о лицензиях, профессионализме, «алгоритм не обосновывает», "
+ "«не является диагнозом», воспроизведение дисклеймеров и методологических оговорок — такие тексты в отчёт не входят.\n"
+ "5) truthfulness: score из scores_block; verdict и cues — текстом по маркерам (моргание, избегание, руки у лица, напряжение, темп речи, паузы, f0).\n"
+ "6) MBTI: >50 по оси = полюс; Enneagram 1..9 с крылом; Temperament — проценты, сумма ~100.\n"
+ "7) Вывод: СТРОГО один валидный JSON без markdown по схеме; rationale <=20 слов."
+)
+
+DEFAULT_USER_PROMPT=(
+    "Проведи оценку по системам Big Five, MBTI, Эннеаграмма, Temperament Theory, HEXACO, PID-5 (DSM-5) "
+    "и оценку правдивости по предоставленным невербальным метрикам. Язык: русский. Соблюдай КОНТРАКТ системного промпта: "
+    "числовые гипотезы обязательны, тотальный null запрещён, доказательства — только из входного списка эпизодов."
+)
+
+HEUR_DEF=(
+    "truth_heuristic = clamp(5..95, 100 - |blink_per_min-20|*1 - avoidance_ratio*60 - tension_ratio*40 - "
+    "hand_face_ratio*30 - min(40,|head_yaw_std-0.1|*120) - max(0,|speech_rate_syll_per_sec-4|*3) - min(20,pause_per_min*1.5)). "
+    "Это невалидированный невербальный приор утечки/нагрузки, НЕ вероятность лжи; использовать только как один из cues."
+)
+
+def load_config(data_dir: Path):
+    p=Path(data_dir)/"llm_config.json"
+    if p.exists():
+        try: return json.loads(p.read_text(encoding="utf-8"))
+        except Exception: pass
+    return {"base_url":"https://sharelim.net/v1","api_key":"","model":"gpt-6-astra","temperature":0.3}
+
+def save_config(data_dir: Path, cfg: dict):
+    (Path(data_dir)/"llm_config.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=1),encoding="utf-8")
+
+def describe_error(e: Exception) -> str:
+    if isinstance(e, httpx.HTTPStatusError):
+        body=(e.response.text or "").strip()
+        return f"API вернул HTTP {e.response.status_code}: {body[:400]}"
+    if isinstance(e, httpx.ConnectError):
+        return f"Не удалось подключиться к хосту: {e.__cause__ or e}"
+    if isinstance(e, httpx.TimeoutException):
+        return "Таймаут запроса к API (90 c)"
+    return f"{type(e).__name__}: {e}"
+
+def is_retriable(e: Exception) -> bool:
+    code=getattr(getattr(e,"response",None),"status_code",None)
+    if code in (524,502,503,504,429): return True
+    return isinstance(e,(httpx.TimeoutException,httpx.ConnectError))
+
+def _as_text(c) -> str:
+    if isinstance(c,str): return c
+    if c is None: return ""
+    if isinstance(c,list):
+        out=[]
+        for b in c:
+            if isinstance(b,dict): out.append(str(b.get("text") or ""))
+            else: out.append(str(b))
+        return "".join(out)
+    return json.dumps(c,ensure_ascii=False)
+
+def chat(cfg: dict, messages: list, timeout=90):
+    url=cfg["base_url"].rstrip("/")+"/chat/completions"
+    headers={"Authorization":f"Bearer {cfg.get('api_key','')}"}
+    payload={"model":cfg.get("model"),"temperature":cfg.get("temperature",0.3),"messages":messages}
+    r=httpx.post(url,json=payload,headers=headers,timeout=timeout)
+    r.raise_for_status()
+    data=r.json()
+    msg=None; fr=""
+    try: msg=data["choices"][0]["message"]; fr=data["choices"][0].get("finish_reason") or ""
+    except Exception: msg=data.get("message") or data
+    return _as_text(msg.get("content") if isinstance(msg,dict) else msg), (fr if isinstance(fr,str) else "")
+
+def ping(cfg: dict): return chat(cfg,[{"role":"user","content":"Ответь одним словом: ok"}])[0]
+
+def repair_json_response(cfg: dict, broken: str):
+    msgs=[{"role":"system","content":"Ты — восстановитель JSON. Верни ТОЛЬКО один валидный JSON-объект без markdown и пояснений."},
+          {"role":"user","content":"Следующий ответ оборван/испорчен. Восстанови его до валидного JSON по исходной схеме:\n\n"+broken[:16000]}]
+    return chat(cfg,msgs)[0]
+
+def _repair_json(s: str):
+    for cut in range(len(s), max(0,len(s)-600), -1):
+        frag=s[:cut]; stack=[]; instr=False; esc=False; ok=True
+        for ch in frag:
+            if instr:
+                if esc: esc=False
+                elif ch=="\\": esc=True
+                elif ch=='"': instr=False
+                continue
+            if ch=='"': instr=True
+            elif ch in "{[": stack.append(ch)
+            elif ch in "}]":
+                if not stack: ok=False; break
+                stack.pop()
+        if not ok or instr: continue
+        f2=frag.rstrip()
+        while f2 and f2[-1] in ",:": f2=f2[:-1]
+        cand=f2+"".join("}" if c=="{" else "]" for c in reversed(stack))
+        try: return json.loads(cand)
+        except Exception: continue
+    return None
+
+def parse_json(text):
+    if not isinstance(text,str): text=_as_text(text)
+    t=text.strip()
+    t=re.sub(r"^```[a-zA-Z]*\s*","",t); t=re.sub(r"\s*```$","",t)
+    try: return json.loads(t)
+    except Exception: pass
+    m=re.search(r"\{.*\}",t,re.S)
+    if m:
+        cand=m.group(0)
+        try: return json.loads(cand)
+        except Exception:
+            fixed=_repair_json(cand)
+            if fixed is not None: return fixed
+    return None
+
+def validate_result(parsed: dict, summary: dict):
+    warn=[]
+    if not isinstance(parsed,dict): return None,["Ответ модели не является JSON-объектом"]
+    ids={e["id"] for e in summary.get("episodes",[])}
+    ev=parsed.get("evidence")
+    if isinstance(ev,dict):
+        for key,items in ev.items():
+            if not isinstance(items,list): continue
+            clean=[]
+            for it in items:
+                if not isinstance(it,dict): continue
+                eid=it.get("episode_id")
+                if eid and eid not in ids:
+                    warn.append(f"{key}: ссылка на несуществующий эпизод '{eid}' удалена")
+                    continue
+                clean.append(it)
+            ev[key]=clean
+    def clamp(d,keys,blk):
+        for k in keys:
+            v=d.get(k)
+            if isinstance(v,(int,float)) and not isinstance(v,bool):
+                if v<0 or v>100:
+                    warn.append(f"{blk}.{k}={v} вне 0..100 — ограничено")
+                    d[k]=float(min(100,max(0,v)))
+    for blk,keys in [("big_five",["openness","conscientiousness","extraversion","agreeableness","neuroticism"]),
+                     ("hexaco",["H","E","X","A","C","O"]),
+                     ("pid5",["negative_affect","detachment","antagonism","disinhibition","psychoticism"])]:
+        if isinstance(parsed.get(blk),dict): clamp(parsed[blk],keys,blk)
+    t=parsed.get("temperament")
+    if isinstance(t,dict):
+        vals=[t[k] for k in ("sanguine","choleric","melancholic","phlegmatic") if isinstance(t.get(k),(int,float))]
+        if vals and abs(sum(vals)-100)>5:
+            warn.append(f"temperament: сумма процентов {round(sum(vals),1)} != 100 — значения помечены ненадёжными")
+            t["_reliable"]=False
+    fillmap=[("big_five",["openness","conscientiousness","extraversion","agreeableness","neuroticism"]),
+             ("hexaco",["H","E","X","A","C","O"]),
+             ("pid5",["negative_affect","detachment","antagonism","disinhibition","psychoticism"])]
+    for blk,keys in fillmap:
+        d=parsed.get(blk)
+        if isinstance(d,dict):
+            miss=[k for k in keys if not isinstance(d.get(k),(int,float))]
+            if miss:
+                for k in miss: d[k]=50.0
+                warn.append(f"{blk}: модель вернула блок без скорингов — заполнено популяционной нормой 50 (shrinkage), confidence не завышается")
+    mb=parsed.get("mbti")
+    if isinstance(mb,dict):
+        ax=mb.get("axes")
+        if not isinstance(ax,dict) or not any(isinstance(ax.get(k),(int,float)) for k in ("E_I","S_N","T_F","J_P")):
+            mb["axes"]={"E_I":50,"S_N":50,"T_F":50,"J_P":50}
+            warn.append("mbti: оси отсутствуют — заполнено 50/50 (shrinkage)")
+    tp=parsed.get("temperament")
+    if isinstance(tp,dict):
+        ks=("sanguine","choleric","melancholic","phlegmatic")
+        if not any(isinstance(tp.get(k),(int,float)) for k in ks):
+            for k in ks: tp[k]=25.0
+            warn.append("temperament: проценты отсутствуют — заполнено 25/25/25/25 (shrinkage)")
+    return parsed,warn
+
+def build_evidence(summary: dict, max_episodes=40):
+    eps=summary.get("episodes",[])
+    counts={}
+    for e in eps: counts[e["pattern"]]=counts.get(e["pattern"],0)+1
+    return {"video":{"duration_sec":summary["duration_sec"],"fps":summary["fps"],"frames":summary["n_frames"]},
+            "pattern_counters":summary["counters"],"pattern_events":summary["events"],
+            "pattern_names":summary["pattern_names"],"stats":summary["stats"],
+            "emotion_distribution":summary["emotions"],"truth_cues":summary["truth_cues"],
+            "truth_heuristic":summary["truth_heuristic"],
+            "truth_heuristic_definition":HEUR_DEF,
+            "method":summary.get("method"),
+            "episode_counts_by_pattern":counts,
+            "episodes":[{"id":e["id"],"pattern":e["pattern"],"name":e["name"],"t0":e["t0"],"t1":e["t1"]} for e in eps[:max_episodes]],
+            "episodes_truncated":len(eps)>max_episodes}
+
+def _force_format(cite_cap: int) -> str:
+    base=("\n\nФОРМАТ: верни РОВНО ОДИН валидный JSON по схеме. Без markdown, без текста вне JSON. "
+     "rationale <=20 слов. Тотальный null запрещён контрактом. Блок без числовых полей (только notes) — нарушение контракта: числа обязательны всегда.")
+    if cite_cap>0:
+        base+=f" В evidence каждой системы <= {cite_cap} эпизодов."
+    else:
+        base+=" В evidence всех систем верни пустые списки: только scores, summary, truthfulness."
+    return base
+
+def run_analysis(cfg: dict, user_prompt: str, evidence: dict, cite_cap: int=6):
+    msgs=[{"role":"system","content":SYSTEM_PROMPT},
+          {"role":"user","content":(user_prompt or DEFAULT_USER_PROMPT)+_force_format(cite_cap)+"\n\nEVIDENCE JSON:\n"+json.dumps(evidence,ensure_ascii=False)}]
+    return chat(cfg,msgs)
