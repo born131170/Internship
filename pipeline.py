@@ -11,22 +11,43 @@ HAND_LINKS=[(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),(9,10),(10,11)
             (9,13),(13,14),(14,15),(15,16),(13,17),(17,18),(18,19),(19,20),(0,17)]
 EMO_CODES={"joy":0,"surprise":1,"anger":2,"sadness":3,"fear":4,"disgust":5}
 
+def _n(v):
+    """NaN-safe: None/NaN -> False-нейтральное значение 0 для порогов."""
+    if v is None: return 0.0
+    if isinstance(v, float) and math.isnan(v): return 0.0
+    return float(v)
+
+def _nn(v):
+    """True если значение измеримо (не None/NaN)."""
+    if v is None: return False
+    return not (isinstance(v, float) and math.isnan(v))
+
+# Научно операционализированные паттерны (пороги — из литературы, см. psychometrics.NORM_SOURCES):
+# P01 blink-эпизоды; P02 кивки (ритмический pitch-осцилляторный паттерн); P03 мобильность головы;
+# P04/P05 иллюстративные жесты; P06 самоуспокаивающие касания лица (adaptors, Kaitz 2007 / Vismara 2016);
+# P07 мелкая моторная активность (fidgeting); P08 закрытая позиция кисти; P09 смены позы;
+# P10 улыбка; P10D Duchenne-улыбка (mouthSmile + orbicularis oculi — Ekman & Friesen 1978);
+# P11 напряжение (browDown/mouthPress/lipPress); P12 отведение взгляда (>35° от медианы головы);
+# P13 вокализация (активная речь); P14 пауза >=0.5 c (когнитивная нагрузка, Vrij 2008).
 PATTERN_DEFS=[
-    ("P01","Моргание",        lambda m: m["blink"]>0.6),
-    ("P02","Кивок при слушании", lambda m: abs(m["pc"])>0.08),
-    ("P03","Движения головы", lambda m: (abs(m["yc"])+abs(m["pc"]))>0.03),
-    ("P04","Жестовый эпизод", lambda m: m["hand_speed"]>0.03),
-    ("P05","Амплитуда/скорость жестов", lambda m: m["hand_speed"]>0.1),
-    ("P06","Рука около лица", lambda m: (m["tif"]>0.5 or m["hfd"]<0.8)),
-    ("P07","Повторные мелкие движения", lambda m: m["hand_speed"]>0.01),
-    ("P08","Положение рук",   lambda m: m["aperture"]<0.8),
-    ("P09","Смена позы",      lambda m: m["menergy"]>0.02),
-    ("P10","Подъём уголков губ", lambda m: m["smile"]>0.4),
-    ("P11","Брови / напряжение губ", lambda m: m["browDown"]>0.3 or m["press"]>0.2),
-    ("P12","Направление взгляда", lambda m: abs(m["yc"])>0.2 or m["pc"]>0.2),
+    ("P01","Моргание",            lambda m: _n(m["blink"])>0.6),
+    ("P02","Кивок при слушании",   lambda m: _n(m["pc"])>0.08),
+    ("P03","Движения головы",      lambda m: (_n(m["yc"])+_n(m["pc"]))>0.03),
+    ("P04","Жестовый эпизод",      lambda m: _n(m["hand_speed"])>0.03),
+    ("P05","Амплитуда/скорость жестов", lambda m: _n(m["hand_speed"])>0.1),
+    ("P06","Рука около лица",      lambda m: ((_n(m["tif"])>0.5 or (_nn(m["hfd"]) and m["hfd"]<0.8)) and m["hands"]>0)),
+    ("P07","Повторные мелкие движения", lambda m: _n(m["hand_speed"])>0.01),
+    ("P08","Положение рук",        lambda m: _nn(m["aperture"]) and m["aperture"]<0.8),
+    ("P09","Смена позы",           lambda m: _n(m["menergy"])>0.02),
+    ("P10","Подъём уголков губ",   lambda m: _n(m["smile"])>0.4),
+    ("P10D","Duchenne-улыбка",     lambda m: _n(m["smile"])>0.35 and _n(m["cheek"])>0.15),
+    ("P11","Брови / напряжение губ", lambda m: _n(m["browDown"])>0.3 or _n(m["press"])>0.2),
+    ("P12","Отведение взгляда",    lambda m: _n(m["yc"])>math.radians(35) or _n(m["pc"])>math.radians(35)),
+    ("P13","Вокализация",          lambda m: bool(m.get("speech"))),
+    ("P14","Пауза в речи ≥0.5 c",  lambda m: _n(m["pause"])>=0.5),
 ]
-PIPELINE_VERSION="4.3-hybrid"
-STATS_CH=["smile","frown","browUp","browDown","eyeWide","blink","jawO","noseW","press",
+PIPELINE_VERSION="5.0-psychometric"
+STATS_CH=["smile","frown","browUp","browDown","eyeWide","blink","jawO","noseW","press","cheek",
           "yaw","pitch","yc","pc","hand_speed","aperture","hfd","hfd2","tif","menergy","face_conf","pose_conf",
           "rms","f0","srate","pause"]
 
@@ -142,8 +163,9 @@ def _draw_series(canvas,x0,y0,w,h,hist,ymin,ymax,color,fill=True,step=False):
         cv2.addWeighted(tmp,0.16,sub,0.84,0,sub)
     cv2.polylines(canvas,[P],False,color,1,cv2.LINE_AA)
 
-def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, width=480, per_pat=0):
+def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, width=480, per_pat=0, models_dir=Path("models")):
     eps=[]; n=len(records)
+    pnames={pid:nm for pid,nm,_ in PATTERN_DEFS}
     if n<4: return eps
     GAP=max(1,int(0.4*fps_proc)); MIN=max(2,int(0.6*fps_proc))
     for pid,pname,fn in PATTERN_DEFS:
@@ -157,20 +179,90 @@ def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, wid
         ints=[(a,b) for a,b in ints if (b-a)>=MIN]
         ints.sort(key=lambda ab: ab[1]-ab[0], reverse=True)
         for k,(a,b) in enumerate(ints if per_pat<=0 else ints[:per_pat]):
+            mid=(a+b)//2
+            # измеримые метрики эпизода — «доказательство» в числовом виде
+            def _mval(ch):
+                vs=[records[i].get(ch) for i in range(a,b+1)]
+                vs=[float(v) for v in vs if v is not None and not (isinstance(v,float) and math.isnan(v))]
+                return round(float(np.mean(vs)),4) if vs else None
+            metrics={ch:_mval(ch) for ch in ("smile","cheek","blink","hand_speed","hfd","tif","menergy","yc","pc","f0","rms","pause") }
+            metrics["hands_max"]=int(max(records[i].get("hands",0) or 0 for i in range(a,b+1)))
             eps.append({"id":f"{pid}_{k:02d}","pattern":pid,"name":pname,
                         "t0":round(records[a]["t"],2),"t1":round(records[b]["t"],2),
-                        "mid":round((records[a]["t"]+records[b]["t"])/2,2),
-                        "frames":b-a+1,"thumb":f"episodes/{pid}_{k:02d}.jpg","clip":f"episodes/{pid}_{k:02d}.mp4"})
+                        "mid":round(records[mid]["t"],2),
+                        "frames":b-a+1,"thumb":f"episodes/{pid}_{k:02d}.jpg","clip":f"episodes/{pid}_{k:02d}.mp4",
+                        "metrics":metrics})
     eps.sort(key=lambda e:e["t0"])
     if not eps: return eps
     cap=cv2.VideoCapture(str(video))
     fw=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640; fh=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 360
     cw=width; chh=max(2,int(fh*width/fw))
+    import mediapipe as _mp
+    from mediapipe.tasks import python as _mppy
+    from mediapipe.tasks.python import vision as _mpv
+    _snap_f=_snap_p=_snap_h=None
+    def _open_snap_models():
+        nonlocal _snap_f,_snap_p,_snap_h
+        md=Path(models_dir)
+        _snap_f=_mpv.FaceLandmarker.create_from_options(_mpv.FaceLandmarkerOptions(
+            base_options=_mppy.BaseOptions(model_asset_path=str(md/"face_landmarker.task")),
+            running_mode=_mpv.RunningMode.VIDEO,num_faces=1,output_face_blendshapes=True))
+        _snap_p=_mpv.PoseLandmarker.create_from_options(_mpv.PoseLandmarkerOptions(
+            base_options=_mppy.BaseOptions(model_asset_path=str(md/"pose_landmarker.task")),
+            running_mode=_mpv.RunningMode.VIDEO,num_poses=1))
+        _snap_h=_mpv.HandLandmarker.create_from_options(_mpv.HandLandmarkerOptions(
+            base_options=_mppy.BaseOptions(model_asset_path=str(md/"hand_landmarker.task")),
+            running_mode=_mpv.RunningMode.VIDEO,num_hands=2))
+    try:
+        _open_snap_models()
+    except Exception:
+        _snap_f=_snap_p=_snap_h=None
+    def _close_snap_models():
+        for m in (_snap_f,_snap_p,_snap_h):
+            try:
+                if m is not None: m.close()
+            except Exception: pass
+    # доказательные скрин-кадры: исходный кадр + наложение контуров MediaPipe и подписи метрик эпизода
+    def _evidence_frame(fr, ep):
+        h0,w0=fr.shape[:2]; sc=cw/w0
+        img=cv2.resize(fr,(cw,chh)); hh,ww=img.shape[:2]
+        rgb=cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
+        im=_mp.Image(image_format=_mp.ImageFormat.SRGB,data=rgb)
+        ts=int(ep["mid"]*1000)
+        try:
+            if _snap_f is not None:
+                frr=_snap_f.detect_for_video(im,ts)
+                if frr.face_landmarks:
+                    for pt in frr.face_landmarks[0]: cv2.circle(img,(int(pt.x*ww),int(pt.y*hh)),1,(0,255,0),-1)
+            if _snap_p is not None:
+                prr=_snap_p.detect_for_video(im,ts)
+                if prr.pose_landmarks:
+                    pts=np.array([[p.x*ww,p.y*hh] for p in prr.pose_landmarks[0]])
+                    for a,b in POSE_LINKS: cv2.line(img,tuple(pts[a].astype(int)),tuple(pts[b].astype(int)),(0,255,255),2)
+            if _snap_h is not None:
+                hrr=_snap_h.detect_for_video(im,ts)
+                for hd in (hrr.hand_landmarks or []):
+                    hp=np.array([[p.x*ww,p.y*hh] for p in hd])
+                    for a,b in HAND_LINKS: cv2.line(img,tuple(hp[a].astype(int)),tuple(hp[b].astype(int)),(255,0,255),1)
+        except Exception:
+            pass
+        nm=pnames.get(ep["pattern"],ep["name"])
+        lines=[f"{ep['pattern']} {nm}  t={ep['t0']:.1f}-{ep['t1']:.1f}s"]
+        mm=ep.get("metrics") or {}
+        kv=[f"{k}={mm[k]}" for k in ("smile","cheek","blink","hand_speed","hfd","tif","menergy","yc","pc","f0","pause") if mm.get(k) is not None][:6]
+        if kv: lines.append(", ".join(kv))
+        pad=6; lh=17; bw=min(ww-10,max(180,max(len(l) for l in lines)*9+12)); bh=len(lines)*lh+10
+        ov=img.copy(); cv2.rectangle(ov,(4,hh-bh-4),(4+bw,hh-4),(0,0,0),-1)
+        cv2.addWeighted(ov,0.62,img,0.38,0,img)
+        for i,ln in enumerate(lines):
+            cv2.putText(img,ln,(10,hh-bh+lh*(i+1)-2),cv2.FONT_HERSHEY_SIMPLEX,0.42,(0,255,255),1,cv2.LINE_AA)
+        return img
+    rec_by_t=None
     for ep in eps:
         cap.set(cv2.CAP_PROP_POS_MSEC, ep["mid"]*1000)
         ok,fr=cap.read()
-        if ok: cv2.imwrite(str(ep_dir/Path(ep["thumb"]).name), cv2.resize(fr,(cw,chh)))
-        else: cv2.imwrite(str(ep_dir/Path(ep["thumb"]).name), np.zeros((chh,cw,3),np.uint8))
+        img=_evidence_frame(fr,ep) if ok else np.zeros((chh,cw,3),np.uint8)
+        cv2.imwrite(str(ep_dir/Path(ep["thumb"]).name), img)
         if not make_clips: continue
         cap.set(cv2.CAP_PROP_POS_MSEC, ep["t0"]*1000)
         wr=cv2.VideoWriter(str(ep_dir/Path(ep["clip"]).name), cv2.VideoWriter_fourcc(*"mp4v"), fps_src, (cw,chh))
@@ -182,6 +274,7 @@ def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, wid
             if t>=ep["t0"]-0.01: wr.write(cv2.resize(fr,(cw,chh)))
         wr.release()
     cap.release()
+    _close_snap_models()
     return eps
 
 def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
@@ -229,7 +322,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             ts=int(real*1000.0/fps)
             right=left.copy()
             face_conf=pose_conf=0.0; n_hands=0; emotion="none"
-            smile=frown=browUp=browDown=eyeWide=blink=jawO=noseW=press=np.nan
+            smile=frown=browUp=browDown=eyeWide=blink=jawO=noseW=press=cheek=np.nan
             yaw=pitch=np.nan; hand_speed=np.nan; aperture=np.nan; hfd=np.nan; menergy=np.nan
             hfd2=np.nan; face_wn=np.nan; nose2n=None; face_box=None; tif=0.0
             a_rms=a_f0=np.nan; a_speech=0; a_srate=a_pause=np.nan; a_vemo=np.nan
@@ -250,6 +343,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
                 if fr.face_blendshapes:
                     s={c.category_name:c.score for c in fr.face_blendshapes[0]}
                     smile=max(s.get("mouthSmileLeft",0),s.get("mouthSmileRight",0)); frown=max(s.get("mouthFrownLeft",0),s.get("mouthFrownRight",0))
+                    cheek=max(s.get("cheekRaiseLeft",0),s.get("cheekRaiseRight",0))  # orbicularis oculi — Duchenne-маркер
                     browUp=s.get("browInnerUp",0); browDown=max(s.get("browDownLeft",0),s.get("browDownRight",0))
                     eyeWide=max(s.get("eyeWideLeft",0),s.get("eyeWideRight",0)); blink=max(s.get("eyeBlinkLeft",0),s.get("eyeBlinkRight",0))
                     jawO=s.get("jawOpen",0); noseW=s.get("noseWrinkle",0); press=max(s.get("mouthPressLeft",0),s.get("mouthPressRight",0))
@@ -306,7 +400,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             pc=pitch-pm_ if not math.isnan(pitch) else np.nan
             rec={"t":round(real/fps,3),"face_conf":round(face_conf,3),"pose_conf":round(pose_conf,3),"hands":n_hands,"emotion":emotion,
                  **{k:round(float(v),4) if not (isinstance(v,float) and math.isnan(v)) else None for k,v in
-                    dict(smile=smile,frown=frown,browUp=browUp,browDown=browDown,eyeWide=eyeWide,blink=blink,jawO=jawO,noseW=noseW,press=press,
+                    dict(smile=smile,frown=frown,browUp=browUp,browDown=browDown,eyeWide=eyeWide,blink=blink,jawO=jawO,noseW=noseW,press=press,cheek=cheek,
                          yaw=yaw,pitch=pitch,yc=yc,pc=pc,hand_speed=hand_speed,aperture=aperture,hfd=hfd,hfd2=hfd2,tif=tif,menergy=menergy,
                          rms=a_rms,f0=a_f0,srate=a_srate,pause=a_pause,voicemo=a_vemo).items()}}
             rec={k:(v if v is not None else float("nan")) for k,v in rec.items()}
@@ -415,7 +509,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
     if audio_sum:
         score-=max(0,abs(cues["speech_rate_syll_per_sec"]-4))*3
         score-=min(20,cues["pause_per_min"]*1.5)
-    episodes=_extract_episodes(records, fps_proc, fps, video, ep_dir, make_clips)
+    episodes=_extract_episodes(records, fps_proc, fps, video, ep_dir, make_clips, models_dir=models_dir)
     method={"P06":"v4-final hybrid: (кончик пальца кисти внутри 2D-бокса лица x1.30 ИЛИ 3D-дистанция запястье->центр головы < 0.8 ширин плеч) AND кисть детектирована; без visibility-гейта; телефон у лица отсеивается"}
     summary={"method":method,"pipeline_version":PIPELINE_VERSION,"video":Path(video).name,"fps":fps,"n_frames":nf,"duration_sec":round(dur,1),
              "counters":counters,"events":events,"stats":stats,"emotions":emo_dist,
