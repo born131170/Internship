@@ -23,65 +23,92 @@ def _ldconfig_has(*names: str):
     return all(any(n in line for line in out.splitlines()) for n in names)
 
 
-def ensure_mediapipe_gl():
-    """Кросс-платформенная проверка работоспособности MediaPipe.
+def _mediapipe_importable():
+    """Реальный тест работоспособности MediaPipe в ЭТОМ окружении (кросс-платформенный).
 
-    Linux (headless/Docker): нужны системные OpenGL-библиотеки libEGL/libGLESv2/libGL
-    (пакеты libegl1, libgles2, libgl1) — без них нативная часть MediaPipe падает с
-    OSError при инициализации моделей.
-
-    Windows/macOS: таких библиотек не существует в принципе (там свой графический стек),
-    поэтому проверять .so бессмысленно — делаем реальный smoke-тест: пытаемся импортировать
-    mediapipe. Если импорт не удался — даём подсказку именно под эту ОС.
+    Пытаемся импортировать mediapipe и создать/удалить FaceLandmarker с заглушкой.
+    На Linux без libEGL/libGLESv2/libGL это бросит OSError — тогда подсказываем apt/dnf.
+    На Windows/macOS таких .so не существует, и этот же тест честно проверяет их стек
+    (VC++ Redistributable, совместимость wheels с версией Python и т.п.).
     """
-    import platform, sys
-    system = platform.system()
-
-    if system != "Linux":
-        # Windows / macOS: OpenGL-.so проверки не применимы. Проверяем сам импорт.
+    try:
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
+        import tempfile
+        # smoke-тест: реальная инициализация нативного графа MediaPipe
+        dummy = tempfile.mktemp(suffix=".task")
+        with open(dummy, "wb") as f:
+            f.write(b"\x00" * 16)
         try:
-            import mediapipe  # noqa: F401
-        except OSError as e:
-            if system == "Windows":
-                hint = ("Переустановите зависимости: pip install --force-reinstall mediapipe opencv-python\n"
-                        "Убедитесь, что установлен Microsoft Visual C++ Redistributable 2015-2022 (x64):\n"
-                        "  https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist\n"
-                        "Если в PATH есть CUDA/cuDNN-библиотеки, но они несовместимы с CPU-версией "
-                        "mediapipe, временно уберите их из PATH.")
-            else:
-                hint = "macOS: переуставновите mediapipe (pip install --force-reinstall mediapipe)."
-            raise RuntimeError(f"MediaPipe не загружается в этом окружении ({system}): {e}.\n{hint}")
-        return []
-
-    # --- Linux: проверяем наличие .so через ldconfig / dlopen ---
-    needed = ["libEGL.so.1", "libGLESv2.so.2", "libGL.so.1"]
-    have = _ldconfig_has(*needed)
-    if have is True:
-        return []
-    if have is False:
-        missing = [n for n in needed if not any(n in l for l in
-                    subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout.splitlines())]
-    else:  # ldconfig нет — пробуем напрямую dlopen через ctypes
-        import ctypes
-        missing = []
-        for n in needed:
+            opts = mp_vision.FaceLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=dummy))
             try:
-                ctypes.CDLL(n)
-            except OSError:
-                missing.append(n)
-    if not missing:
+                mp_vision.FaceLandmarker.create_from_options(opts)  # упадет на битом файле, но НЕ на библиотеках
+            except Exception:
+                pass  # ошибка парсинга модели = нативный код работает
+        finally:
+            import os
+            try: os.remove(dummy)
+            except OSError: pass
+        return None
+    except OSError as e:
+        return str(e)
+
+
+def ensure_mediapipe_gl():
+    """Кросс-платформенная проверка MediaPipe: сначала реальный импорт+инициализация.
+
+    Если что-то не загрузилось — формируем подсказку под конкретную ОС:
+      Linux   -> недостающие OpenGL-библиотеки (libegl1 libgles2 libgl1), автоустановка через run.py;
+      Windows -> VC++ Redistributable / переустановка wheels / Python 3.9-3.12;
+      macOS   -> переустановка mediapipe.
+    """
+    import platform
+    system = platform.system()
+    err = _mediapipe_importable()
+    if err is None:
         return []
-    pkgs = {"libEGL.so.1": "libegl1", "libGLESv2.so.2": "libgles2", "libGL.so.1": "libgl1"}
-    cmd = "sudo apt-get update && sudo apt-get install -y " + " ".join(pkgs.get(m, m) for m in missing)
-    raise RuntimeError(
-        "MediaPipe требует системные OpenGL-библиотеки, которых нет в этом окружении: "
-        + ", ".join(missing)
-        + ".\nУстановите их командой (Debian/Ubuntu):\n  " + cmd
-        + "\nДля Fedora: sudo dnf install -y mesa-libEGL mesa-libGLES mesa-libGL"
-        + "\nДля Arch: sudo pacman -S mesa libglvnd"
-        + "\n(или запускайте приложение через `python run.py` — он установит их автоматически, если есть права root)"
-        + "\n\nВАЖНО: эти библиотеки нужны ТОЛЬКО на Linux. На Windows их ставить не нужно —"
-        " там достаточно `pip install -r requirements.txt`.")
+    # Импорт/инициализация упала. Разбираем причину по ОС.
+    so_needed = ["libEGL.so.1", "libGLESv2.so.2", "libGL.so.1"]
+    missing = [n for n in so_needed if n in err]
+    if system == "Linux":
+        if not missing:
+            # не хватает не обязательно этих .so — перечислим через ldconfig всё недостающее
+            have = _ldconfig_has(*so_needed)
+            if have is False or have is None:
+                import ctypes
+                missing = [n for n in so_needed if not _dlopen_ok(n)]
+        pkgs = {"libEGL.so.1": "libegl1", "libGLESv2.so.2": "libgles2", "libGL.so.1": "libgl1"}
+        cmd = "sudo apt-get update && sudo apt-get install -y " + " ".join(pkgs.get(m, m) for m in missing or so_needed)
+        raise RuntimeError(
+            "MediaPipe не загружается (Linux): " + err
+            + "\nУстановите системные OpenGL-библиотеки:\n  " + cmd
+            + "\nДля Fedora: sudo dnf install -y mesa-libEGL mesa-libGLES mesa-libGL"
+            + "\nДля Arch: sudo pacman -S mesa libglvnd"
+            + "\n(или запускайте через `python run.py` — он установит их автоматически при наличии прав)")
+    if system == "Windows":
+        raise RuntimeError(
+            "MediaPipe не загружается на Windows: " + err
+            + "\nЧто сделать (по порядку):"
+            + "\n1) pip install --force-reinstall mediapipe opencv-python numpy"
+            + "\n2) Установите Microsoft Visual C++ Redistributable 2015-2022 (x64):"
+            + "\n   https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist"
+            + "\n3) Проверьте версию Python: медиa pipe поддерживает 3.9-3.12."
+            + " У вас стоит 3.13 — установите Python 3.11/3.12 и запускайте `py -3.11 run.py`."
+            + "\n(Системные библиотеки libEGL/libGL на Windows НЕ нужны — команды apt-get не существует.)")
+    raise RuntimeError("MediaPipe не загружается (" + system + "): " + err
+        + "\nПопробуйте: pip install --force-reinstall mediapipe")
+
+
+def _dlopen_ok(name: str) -> bool:
+    import ctypes
+    try:
+        ctypes.CDLL(name)
+        return True
+    except OSError:
+        return False
+
 
 POSE_LINKS=[(5,6),(5,7),(7,9),(6,8),(8,10),(5,11),(6,12),(11,12),(11,13),(13,15),(12,14),(14,16)]
 HAND_LINKS=[(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),(9,10),(10,11),(11,12),
