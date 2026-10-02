@@ -56,14 +56,29 @@ def load_config(data_dir: Path):
 def save_config(data_dir: Path, cfg: dict):
     (Path(data_dir)/"llm_config.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=1),encoding="utf-8")
 
+DEFAULT_TIMEOUT=180  # сек; сложный JSON-анализ по видео часто готовится дольше 90 с
+
+def _timeout(cfg: dict=None) -> int:
+    if cfg is None:
+        try: cfg=json.loads((Path("data")/"llm_config.json").read_text(encoding="utf-8"))
+        except Exception: cfg={}
+    try:
+        t=int(cfg.get("timeout_sec") or DEFAULT_TIMEOUT)
+    except Exception:
+        t=DEFAULT_TIMEOUT
+    return max(30,min(600,t))
+
 def describe_error(e: Exception) -> str:
     if isinstance(e, httpx.HTTPStatusError):
         body=(e.response.text or "").strip()
         return f"API вернул HTTP {e.response.status_code}: {body[:400]}"
     if isinstance(e, httpx.ConnectError):
         return f"Не удалось подключиться к хосту: {e.__cause__ or e}"
+    if isinstance(e, httpx.ReadTimeout):
+        return (f"Сервер LLM не вернул ответ за {_timeout()} с (обработка заняла слишком долго). "
+                "Уменьшите число эпизодов (stride больше / короче видео) или увеличьте timeout_sec в llm_config.json.")
     if isinstance(e, httpx.TimeoutException):
-        return "Таймаут запроса к API (90 c)"
+        return f"Таймаут запроса к API ({_timeout()} c)"
     return f"{type(e).__name__}: {e}"
 
 def is_retriable(e: Exception) -> bool:
@@ -82,12 +97,23 @@ def _as_text(c) -> str:
         return "".join(out)
     return json.dumps(c,ensure_ascii=False)
 
-def chat(cfg: dict, messages: list, timeout=90):
+def chat(cfg: dict, messages: list, timeout=None):
     url=cfg["base_url"].rstrip("/")+"/chat/completions"
     headers={"Authorization":f"Bearer {cfg.get('api_key','')}"}
     payload={"model":cfg.get("model"),"temperature":cfg.get("temperature",0.3),"messages":messages}
-    r=httpx.post(url,json=payload,headers=headers,timeout=timeout)
-    r.raise_for_status()
+    to=_timeout(cfg) if timeout is None else timeout
+    # httpx.Timeout: connect ограничен 15 с, чтение/запись ждут полной генерации ответа
+    tmo=httpx.Timeout(float(to),connect=15.0)
+    last=None
+    for attempt in range(2):  # одна повторная попытка при read-timeout (частая медленность big-model через прокси)
+        try:
+            r=httpx.post(url,json=payload,headers=headers,timeout=tmo)
+            r.raise_for_status()
+            break
+        except httpx.ReadTimeout as e:
+            last=e
+            if attempt==0: continue
+            raise
     data=r.json()
     msg=None; fr=""
     try: msg=data["choices"][0]["message"]; fr=data["choices"][0].get("finish_reason") or ""
@@ -200,7 +226,7 @@ def build_evidence(summary: dict, max_episodes=40):
     eps=summary.get("episodes",[])
     counts={}
     for e in eps: counts[e["pattern"]]=counts.get(e["pattern"],0)+1
-    return {"video":{"duration_sec":summary["duration_sec"],"fps":summary["fps"],"frames":summary["n_frames"]},
+    evidence={"video":{"duration_sec":summary["duration_sec"],"fps":summary["fps"],"frames":summary["n_frames"]},
             "pattern_counters":summary["counters"],"pattern_events":summary["events"],
             "pattern_names":summary["pattern_names"],"stats":summary["stats"],
             "emotion_distribution":summary["emotions"],"truth_cues":summary["truth_cues"],

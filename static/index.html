@@ -313,13 +313,23 @@ function renderAnalysis(){const p=RESULT&&RESULT.parsed; const sc=(RESULT&&RESUL
     const psychEvs = psychDet ? ["extraversion","agreeableness","conscientiousness","neuroticism","openness"].map(tt=>psychEvHtml(tt)).join("") : "";
     return `<div class="syscard"><h3>${t} ${d?(head?`<span class="tag">${head(d)}</span>`:`<span class="tag">данные получены</span>`):`<span class="tag" style="opacity:.5">ждём данных</span>`}${d&&d._reliable===false?'<span class="tag">ненадёжно</span>':""}</h3>${rows}${dn&&dn.notes?`<div class="lbl" style="margin:6px 0">${dn.notes}</div>`:""}${k==="big_five"&&psychBars?`<div class="lbl" style="margin-top:8px"><b>Локальный движок MediaPipe — детерминированная LR-агрегация (без LLM):</b></div>${psychBars}`:""}<div class="grid" style="margin-top:8px">${evHtml}</div>${psychEvs}</div>`;
   }).join("");}
+async function llmPoll(){ // опрос фоновой LLM-задачи (без client timeout)
+  for(;;){ await new Promise(r=>setTimeout(r,1500));
+    const j=await api(`/api/llm/jobs/${VID}`);
+    if(j.state==="error") throw new Error(j.msg||"ошибка LLM-анализа");
+    if(j.state==="done") return j.result;
+    const p=Math.round((j.progress||0)*100);
+    $("#anState").textContent=(j.msg||"LLM думает…")+` ${p}%`; $("#runState").textContent=$("#anState").textContent;
+  }
+}
 async function runLLM(){ if(!VID){ try{ if(!await loadLatest()) return alert("Нет завершённых анализов на диске"); }catch(e){ return alert(errText(e)); } }
   let st; try{ st=await api("/api/llm/status"); }catch(e){ return alert(errText(e)); }
   if(!st.configured){ $("#anState").textContent="LLM не подключён — заполните настройки"; setLLMChip(false);
     return alert("LLM не настроен: укажите Base URL, API key и модель, затем «Проверить»."); }
   $("#anState").innerHTML=SPIN+"LLM думает…"; $("#runState").innerHTML=SPIN+"LLM думает…";
   try{
-    const r=await api(`/api/videos/${VID}/llm/analyze`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:$("#prompt").value})});
+    await api(`/api/videos/${VID}/llm/analyze`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:$("#prompt").value})});
+    const r=await llmPoll();
     RESULT=r; $("#rawOut").textContent=r.raw; renderAnalysis(); setLLMChip(true,st.model);
     $("#anState").textContent="готово"+((r.warnings||[]).length?`, предупреждений: ${r.warnings.length}`:""); $("#runState").textContent="готово";
     renderTruth(await api(`/api/videos/${VID}/truth`));

@@ -9,6 +9,7 @@ import scoring
 DATA=Path("data"); SNAP=DATA/"snapshots"; STATIC=Path(__file__).parent/"static"
 DATA.mkdir(exist_ok=True); SNAP.mkdir(parents=True, exist_ok=True)
 JOBS: dict = {}
+LLM_JOBS: dict = {}
 app=FastAPI(title="PersonaScope")
 
 @app.middleware("http")
@@ -214,27 +215,29 @@ def test_cfg(payload: dict = None):
     except Exception as e:
         return JSONResponse(status_code=502,content={"ok":False,"error":llm.describe_error(e)})
 
-@app.post("/api/videos/{vid}/llm/analyze")
-def llm_analyze(vid: str, payload: dict = None):
-    payload=payload or {}
+def _llm_job(vid: str, user_prompt: str):
+    """Фоновый LLM-аналитик: браузер не ждёт ответа API (защита от client/browser timeout)."""
+    j=LLM_JOBS[vid]
     try:
         d=_vdir(vid)
         s=json.loads((d/"summary.json").read_text(encoding="utf-8"))
         scores=scoring.compute_scores(s)
         cfg=llm.load_config(DATA)
-        if not (cfg.get("base_url") and cfg.get("api_key") and cfg.get("model")):
-            return JSONResponse(status_code=409,content={"error":"LLM не настроен: укажите Base URL, API key и модель в «Настройки LLM» и нажмите «Сохранить»"})
+        j.update(state="running",progress=0.15,msg="Запрос к LLM (модель готовит JSON-отчёт)…")
         warnings=[]; evidence=llm.build_evidence(s); raw=None; finish=None
         evidence["scores_block"]=scores
         for cap in (4,2,0):
             try:
-                raw,finish=llm.run_analysis(cfg,payload.get("prompt") or llm.DEFAULT_USER_PROMPT,evidence,cite_cap=cap)
+                j.update(progress=0.3+0.2*(4-cap)//4,
+                         msg=f"LLM-запрос (лимит доказательств ≤{cap} на систему)…")
+                raw,finish=llm.run_analysis(cfg,user_prompt,evidence,cite_cap=cap)
                 break
             except Exception as e:
                 if cap==0 or not llm.is_retriable(e):
                     traceback.print_exc()
-                    return JSONResponse(status_code=502,content={"error":llm.describe_error(e)})
-                warnings.append(f"API: {llm.describe_error(e)} — повторный запрос с ограничением доказательств (≤{2 if cap==4 else 0} на систему)")
+                    j.update(state="error",msg=llm.describe_error(e)); return
+                warnings.append(f"API: {llm.describe_error(e)} — повторный запрос с ограничением доказательств (≤{2 if cap==4 else 0} на системы)")
+        j.update(progress=0.75,msg="Разбор и валидация ответа…")
         if finish=="length":
             warnings.append("Ответ модели оборван на лимите токенов прокси (finish_reason=length)")
         parsed=llm.parse_json(raw)
@@ -255,11 +258,48 @@ def llm_analyze(vid: str, payload: dict = None):
         else:
             parsed,w=llm.validate_result(parsed,s); warnings+=w
             parsed=scoring.enrich_parsed(parsed,s)
-        (d/"llm_result.json").write_text(json.dumps({"raw":raw,"parsed":parsed,"warnings":warnings,"scores":scores},ensure_ascii=False),encoding="utf-8")
-        return {"raw":raw,"parsed":parsed,"warnings":warnings,"scores":scores}
+        res={"raw":raw,"parsed":parsed,"warnings":warnings,"scores":scores}
+        (d/"llm_result.json").write_text(json.dumps(res,ensure_ascii=False),encoding="utf-8")
+        j.update(state="done",progress=1.0,msg="Готово",result=res)
+    except Exception as e:
+        traceback.print_exc()
+        j.update(state="error",msg=f"Внутренняя ошибка сервера: {llm.describe_error(e)}")
+
+@app.post("/api/videos/{vid}/llm/analyze")
+def llm_analyze(vid: str, payload: dict = None):
+    payload=payload or {}
+    try:
+        d=_vdir(vid)
+        if not (d/"summary.json").exists():
+            return JSONResponse(status_code=409,content={"error":"Сначала выполните анализ видео (MediaPipe)"})
+        cfg=llm.load_config(DATA)
+        if not (cfg.get("base_url") and cfg.get("api_key") and cfg.get("model")):
+            return JSONResponse(status_code=409,content={"error":"LLM не настроен: укажите Base URL, API key и модель в «Настройки LLM» и нажмите «Сохранить»"})
+        cur=LLM_JOBS.get(vid)
+        if cur and cur.get("state")=="running":
+            return {"job_id":vid,"state":"running","accepted":True}
+        job={"state":"running","progress":0.0,"msg":"старт"}; LLM_JOBS[vid]=job
+        threading.Thread(target=_llm_job,args=(vid,payload.get("prompt") or llm.DEFAULT_USER_PROMPT),daemon=True).start()
+        return {"job_id":vid,"state":"started","accepted":True}
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=502,content={"error":f"Внутренняя ошибка сервера: {llm.describe_error(e)}"})
+
+@app.get("/api/llm/jobs/{vid}")
+def llm_job_status(vid: str):
+    j=LLM_JOBS.get(vid)
+    if not j:
+        # после перезапуска сервера — отдаём сохранённый результат, если он есть
+        try:
+            p=_vdir(vid)/"llm_result.json"
+            if p.exists():
+                return {"state":"done","msg":"Из сохранённого результата","progress":1.0,"result":json.loads(p.read_text(encoding="utf-8"))}
+        except Exception: pass
+        return JSONResponse(status_code=404,content={"error":"Задача LLM-анализа не найдена"})
+    out=dict(j.__dict__)
+    if out.get("state")=="done": out["result"]=out.pop("result",None)
+    else: out.pop("result",None)
+    return out
 
 SYSREP=[("big_five","Big Five",lambda p:[("Openness",p.get("openness")),("Conscientiousness",p.get("conscientiousness")),("Extraversion",p.get("extraversion")),("Agreeableness",p.get("agreeableness")),("Neuroticism",p.get("neuroticism"))]),
  ("mbti","MBTI",lambda p:[("E/I",(p.get("axes") or {}).get("E_I")),("S/N",(p.get("axes") or {}).get("S_N")),("T/F",(p.get("axes") or {}).get("T_F")),("J/P",(p.get("axes") or {}).get("J_P")),("type",p.get("type"))]),
