@@ -1,10 +1,57 @@
 """PersonaScope pipeline v4.2 (финальная сборка): MediaPipe + аудио + геометрический P06 + приглушённый неон."""
 from __future__ import annotations
-import json, math, subprocess, wave
+import json, math, os, subprocess, wave
 from collections import deque
 from pathlib import Path
+
+# Headless-окружения (Docker/Debian/Ubuntu/slim-образа) часто не содержат системные
+# OpenGL-библиотеки, которые динамически подгружает нативная часть MediaPipe при
+# инициализации landmarker-моделей:
+#   OSError: libEGL.so.1: cannot open shared object file: No such file or directory
+#   OSError: libGLESv2.so.2 / libGL.so.1: cannot open shared object file ...
+# Устанавливаем их (см. ensure_mediapipe_gl() ниже); заодно даём понятное сообщение об ошибке.
 import cv2
 import numpy as np
+
+
+def _ldconfig_has(*names: str):
+    """Есть ли нужные .so в кэше динамического загрузчика (ldconfig -p)."""
+    try:
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None  # ldconfig недоступен (не Linux) — проверять дальше бесполезно
+    return all(any(n in line for line in out.splitlines()) for n in names)
+
+
+def ensure_mediapipe_gl():
+    """Проверяет наличие OpenGL-библиотек, требуемых MediaPipe; возвращает список недостающих.
+
+    Для Debian/Ubuntu ставятся пакеты libegl1, libgles2, libgl1 (mesa-заглушки для headless).
+    """
+    needed = ["libEGL.so.1", "libGLESv2.so.2", "libGL.so.1"]
+    have = _ldconfig_has(*needed)
+    if have is True:
+        return []
+    if have is False:
+        missing = [n for n in needed if not any(n in l for l in
+                    subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout.splitlines())]
+    else:  # ldconfig нет — пробуем напрямую dlopen через ctypes
+        import ctypes
+        missing = []
+        for n in needed:
+            try:
+                ctypes.CDLL(n)
+            except OSError:
+                missing.append(n)
+    if not missing:
+        return []
+    pkgs = {"libEGL.so.1": "libegl1", "libGLESv2.so.2": "libgles2", "libGL.so.1": "libgl1"}
+    cmd = "apt-get update && apt-get install -y " + " ".join(pkgs.get(m, m) for m in missing)
+    raise RuntimeError(
+        "MediaPipe требует системные OpenGL-библиотеки, которых нет в этом окружении: "
+        + ", ".join(missing)
+        + ".\nУстановите их командой:\n  " + cmd
+        + "\n(или запускайте приложение через `python run.py` — он установит их автоматически, если есть права root)")
 
 POSE_LINKS=[(5,6),(5,7),(7,9),(6,8),(8,10),(5,11),(6,12),(11,12),(11,13),(13,15),(12,14),(14,16)]
 HAND_LINKS=[(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),(9,10),(10,11),(11,12),
@@ -197,6 +244,7 @@ def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, wid
     cap=cv2.VideoCapture(str(video))
     fw=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640; fh=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 360
     cw=width; chh=max(2,int(fh*width/fw))
+    ensure_mediapipe_gl()
     import mediapipe as _mp
     from mediapipe.tasks import python as _mppy
     from mediapipe.tasks.python import vision as _mpv
@@ -278,7 +326,11 @@ def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, wid
     return eps
 
 def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
-                  make_dashboard=True, make_clips=True, progress_cb=None, models_dir=Path("models")):
+                  make_dashboard=True, make_clips=True, progress_cb=None, models_dir=Path("models"),
+                  personality=True):
+    """Мультимодальный конвейер: MediaPipe (лицо/поза/руки) + аудио-просодия → паттерны P01–P14 →
+    эпизоды с доказательными скрин-кадрами → детерминированный психометрический слой (psychometrics.assess)."""
+    ensure_mediapipe_gl()
     import mediapipe as mp
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
@@ -329,9 +381,16 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             if audio is not None and idx<len(audio[0]):
                 a_rms=float(audio[0][idx]); a_f0=float(audio[1][idx])
                 a_speech=int(audio[2][idx]); a_srate=float(audio[3][idx]); a_pause=float(audio[4][idx]); a_vemo=float(audio[5][idx])
+            lm_pack=None
             fr=fm.detect_for_video(img,ts)
             if fr.face_landmarks:
                 fl=fr.face_landmarks[0]
+                # ключевые точки для AU6 (orbicularis oculi, Duchenne) по геометрии глаза:
+                # L/R — верхняя точка среднего разреза глаза, B/b — нижнее веко, O/o — внешний угол
+                lm_pack={"L":[round(fl[159].x,4),round(fl[159].y,4)],"B":[round(fl[145].x,4),round(fl[145].y,4)],
+                         "O":[round(fl[33].x,4),round(fl[33].y,4)],
+                         "R":[round(fl[386].x,4),round(fl[386].y,4)],"b":[round(fl[374].x,4),round(fl[374].y,4)],
+                         "o":[round(fl[263].x,4),round(fl[263].y,4)]}
                 face_conf=float(np.mean([getattr(p,"visibility",1.0) or 1.0 for p in fl]))
                 for pt in fl: cv2.circle(right,(int(pt.x*w),int(pt.y*h)),1,(0,255,0),-1)
                 lm3=np.array([[p.x,p.y,p.z] for p in fl]); ctr=lm3.mean(0); f=lm3[1]-ctr
@@ -405,6 +464,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
                          rms=a_rms,f0=a_f0,srate=a_srate,pause=a_pause,voicemo=a_vemo).items()}}
             rec={k:(v if v is not None else float("nan")) for k,v in rec.items()}
             rec["speech"]=a_speech
+            rec["lm"]=lm_pack  # геометрия глаз для AU6 (Duchenne) в psychometrics._ocu
             records.append(rec)
             if make_dashboard:
                 hud=[f"t={real/fps:6.1f}s",f"face={face_conf:.2f} pose={pose_conf:.2f} hands={n_hands}",
@@ -463,7 +523,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
         counters[pid]=c; events[pid]=e
     stats={}
     for ch in STATS_CH:
-        vals=[r[ch] for r in records if not math.isnan(r[ch])]
+        vals=[r[ch] for r in records if isinstance(r.get(ch),(int,float)) and not math.isnan(float(r[ch]))]
         stats[ch]={"mean":round(float(np.mean(vals)),4),"std":round(float(np.std(vals)),4),
                    "min":round(float(np.min(vals)),4),"max":round(float(np.max(vals)),4)} if vals else None
     emo_dist={}
@@ -510,10 +570,22 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
         score-=max(0,abs(cues["speech_rate_syll_per_sec"]-4))*3
         score-=min(20,cues["pause_per_min"]*1.5)
     episodes=_extract_episodes(records, fps_proc, fps, video, ep_dir, make_clips, models_dir=models_dir)
+    # ---- детерминированный психометрический слой (LR-агрегация, нормы из литературы) ----
+    psych=None
+    if personality:
+        try:
+            import traceback as _tb
+            import psychometrics
+            psych=psychometrics.assess(records, summary=None)
+            _attach_psych_evidence(psych, episodes)
+        except Exception:
+            _tb.print_exc()
+            psych=None
     method={"P06":"v4-final hybrid: (кончик пальца кисти внутри 2D-бокса лица x1.30 ИЛИ 3D-дистанция запястье->центр головы < 0.8 ширин плеч) AND кисть детектирована; без visibility-гейта; телефон у лица отсеивается"}
     summary={"method":method,"pipeline_version":PIPELINE_VERSION,"video":Path(video).name,"fps":fps,"n_frames":nf,"duration_sec":round(dur,1),
              "counters":counters,"events":events,"stats":stats,"emotions":emo_dist,
              "audio":audio_sum,"truth_cues":cues,"truth_heuristic":int(max(5,min(95,score))),
-             "episodes":episodes,"pattern_names":{pid:nm for pid,nm,_ in PATTERN_DEFS}}
+             "episodes":episodes,"pattern_names":{pid:nm for pid,nm,_ in PATTERN_DEFS},
+             "personality":psych}
     (out_dir/"summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=1),encoding="utf-8")
     return summary

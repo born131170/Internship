@@ -87,7 +87,8 @@ def analyze(vid: str, stride: int=2, width: int=640, clips: bool=True):
             JOBS[vid].update(state="done",progress=1.0,msg="готово")
         except Exception as e:
             traceback.print_exc()
-            JOBS[vid].update(state="error",msg=repr(e))
+            msg = str(e) if isinstance(e, RuntimeError) else repr(e)
+            JOBS[vid].update(state="error", msg=msg)
     threading.Thread(target=run,daemon=True).start()
     return {"job":vid}
 
