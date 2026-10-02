@@ -450,7 +450,8 @@ $("#btnSearch").onclick=async()=>{ let target=SEARCH_VID||VID;
    $("#resList").innerHTML=(r.results||[]).map((x,i)=>`<div class="ep"><div class="b">#${i+1} <span class="tc">${fmt(x.t0)}–${fmt(x.t1)}</span><br>${x.pattern?`<span class="tag">${x.pattern}</span>`:""}distance: <b>${x.distance}</b><br>
     <button class="btn sec" onclick="jumpT(${x.t0})">▶ показать</button></div></div>`).join("")||"<span class='lbl'>ничего не найдено</span>";
    const m=r.meta||{};
-   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Эпизодов паттерна в видео: "+(m.total!=null?m.total:(r.results||[]).length)+" (равно счётчику индикаторов при множителе 1.0); показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."; }
+   const modeNote=m.mode==="free"?" (скользящее окно: эпизоды паттерна не сегментировались)":(m.total===0?" — эпизодов паттерна в этом видео нет":"");
+   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+modeNote; }
   catch(e){ alert("Ошибка поиска: "+errText(e)); } };
 window.jumpT=t=>{ const sv=$("#searchVideo");
   if(SEARCH_VID && !$("#extCard").hidden){ sv.currentTime=t; sv.play(); }

@@ -185,9 +185,10 @@ def search(vid: str, payload: dict):
         if sid: snap=json.loads((SNAP/f"{sid}.json").read_text(encoding="utf-8"))
         elif payload.get("snapshot"): snap=payload["snapshot"]
         else: return JSONResponse(status_code=422,content={"error":"нужен snapshot_id или snapshot"})
-        mode=payload.get("mode") or ("episodes" if snap.get("pattern") else "free")
+        mode=payload.get("mode") or None   # None -> автовыбор в snapshots.search
         res,meta=snapshots.search(recs,snap,hop=float(payload.get("hop",0.25)),
-                                  top_k=int(payload.get("top_k",10)),mode=mode)
+                                  top_k=int(payload.get("top_k",100)),mode=mode,
+                                  pattern=payload.get("pattern"))
         return {"snapshot":snap["id"],"results":res,"total":len(res),"meta":meta}
     except Exception as e:
         traceback.print_exc()
