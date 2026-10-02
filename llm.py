@@ -210,6 +210,25 @@ def build_evidence(summary: dict, max_episodes=40):
             "episode_counts_by_pattern":counts,
             "episodes":[{"id":e["id"],"pattern":e["pattern"],"name":e["name"],"t0":e["t0"],"t1":e["t1"]} for e in eps[:max_episodes]],
             "episodes_truncated":len(eps)>max_episodes}
+    # детерминированный психометрический слой (Big Five LR + кадры-доказательства) — если есть
+    ps=summary.get("personality")
+    if isinstance(ps,dict):
+        bf=ps.get("big_five") or {}
+        det={t:{k:v for k,v in (tr or {}).items() if k in ("score","ci95","n_indicators","status")}
+             for t,tr in (bf.get("_detail") or {}).items() if isinstance(tr,dict)}
+        ev={}
+        for t,tr in (bf.get("_detail") or {}).items():
+            if isinstance(tr,dict):
+                ev[t]=[{kk:x.get(kk) for kk in ("var","value","lr","tier","direction","note","episode_id","pattern","t0","t1")}
+                       for x in tr.get("evidence_frames",[])]
+        evidence["psychometrics"]={"version":ps.get("version"),
+            "big_five_scores":{k:v for k,v in bf.items() if k!="_detail"},
+            "big_five_detail":det,"evidence_frames":ev,
+            "behavior":ps.get("behavior"),"derived":ps.get("derived"),
+            "truthfulness":ps.get("truthfulness"),
+            "model_validity":ps.get("model_validity"),
+            "instruction":"Используй psychometrics как приоритетный количественный базис для big_five; эпизоды из evidence_frames — реальные кадры-доказательства (ссылайся на их episode_id)."}
+    return evidence
 
 def _force_format(cite_cap: int) -> str:
     base=("\n\nФОРМАТ: верни РОВНО ОДИН валидный JSON по схеме. Без markdown, без текста вне JSON. "

@@ -325,6 +325,69 @@ def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, wid
     _close_snap_models()
     return eps
 
+# ---------------- привязка кадров-доказательств к психометрическим оценкам ----------------
+# var (из psychometrics.INDICATORS) -> (код эпизода из PATTERN_DEFS, ключ метрики эпизода)
+_VAR_EPISODE = {
+    "smile_time_ratio":      ("P10", "smile"),
+    "duchenne_ratio":        ("P10D", "smile"),
+    "neg_expression_ratio":  ("P11", "browDown"),
+    "blink_rate_bpm":        ("P01", "blink"),
+    "gesture_rate_per_min":  ("P05", "hand_speed"),
+    "self_touch_rate_per_min": ("P06", "tif"),
+    "postural_shift_per_min": ("P09", "menergy"),
+    "gaze_avoidance_ratio":  ("P12", "yc"),
+    "head_yaw_std_rad":      ("P03", "yc"),
+    "expression_intensity_std": ("P10", "smile"),
+    "pause_per_min":         ("P14", "pause"),
+}
+
+def _attach_psych_evidence(psych, episodes):
+    """Для каждого индикатора каждой черты Big Five подбирает реальные скрин-кадры
+    эпизодов из видео (уже записанные _extract_episodes в episodes/*.jpg), где этот
+    поведенческий паттерн наблюдался наиболее выраженно. Никаких синтетических
+    изображений: берётся кадр ровно на середину эпизода с наложенными контурами
+    MediaPipe и подписью измеренных значений."""
+    by_pat = {}
+    for e in episodes:
+        by_pat.setdefault(e["pattern"], []).append(e)
+    TRAIT_RU = {"extraversion": "Экстраверсия", "agreeableness": "Доброжелательность",
+                "conscientiousness": "Добросовестность", "neuroticism": "Нейротизм",
+                "openness": "Открытость"}
+    bf = psych.get("big_five") or {}
+    detail = bf.get("_detail") or {}
+    for trait, tr in detail.items():
+        if not isinstance(tr, dict):
+            continue
+        ev = []
+        used_ids = set()
+        for d in tr.get("basis", []):
+            pid, mkey = _VAR_EPISODE.get(d.get("var"), (None, None))
+            cands = [e for e in by_pat.get(pid, []) if e["id"] not in used_ids]
+            if not cands:
+                continue
+            # самый выраженный эпизод: максимум |метрики| относительно среднего по эпизодам
+            def _score(e):
+                v = (e.get("metrics") or {}).get(mkey)
+                return abs(v) if v is not None else 0.0
+            best = max(cands, key=_score)
+            used_ids.add(best["id"])
+            lr = d.get("lr")
+            direction = "за" if (lr is not None and lr >= 1) else "против"
+            ev.append({"var": d["var"], "trait": trait, "trait_ru": TRAIT_RU.get(trait, trait),
+                       "value": d.get("value"), "lr": lr, "tier": d.get("tier"),
+                       "direction": direction, "note": d.get("note"),
+                       "episode_id": best["id"], "pattern": best["pattern"],
+                       "t0": best["t0"], "t1": best["t1"], "thumb": best["thumb"]})
+        # сортировка по силе доказательства (|ln LR|)
+        try:
+            ev.sort(key=lambda x: abs(math.log(float(x["lr"]))) if x.get("lr") else 0, reverse=True)
+        except Exception:
+            pass
+        tr["evidence_frames"] = ev[:6]
+    psych["evidence_total"] = sum(len((tr or {}).get("evidence_frames", []))
+                                  for tr in detail.values() if isinstance(tr, dict))
+
+
 def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
                   make_dashboard=True, make_clips=True, progress_cb=None, models_dir=Path("models"),
                   personality=True):
@@ -574,11 +637,11 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
     psych=None
     if personality:
         try:
-            import traceback as _tb
             import psychometrics
             psych=psychometrics.assess(records, summary=None)
             _attach_psych_evidence(psych, episodes)
         except Exception:
+            import traceback as _tb
             _tb.print_exc()
             psych=None
     method={"P06":"v4-final hybrid: (кончик пальца кисти внутри 2D-бокса лица x1.30 ИЛИ 3D-дистанция запястье->центр головы < 0.8 ширин плеч) AND кисть детектирована; без visibility-гейта; телефон у лица отсеивается"}
