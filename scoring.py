@@ -90,9 +90,12 @@ def enrich_parsed(parsed, s, min_items=2, max_items=6):
     if not isinstance(parsed,dict): return parsed
     ev=parsed.get("evidence")
     if not isinstance(ev,dict): ev={}; parsed["evidence"]=ev
-    ae=auto_evidence(s,max_items)
+    try:
+        ae=auto_evidence(s,max_items)
+    except Exception:
+        return parsed
     for key,auto in ae.items():
-        cur=[x for x in ev.get(key,[]) if isinstance(x,dict)]
+        cur=[x for x in (ev.get(key) or []) if isinstance(x,dict)]
         have={x.get("episode_id") for x in cur}
         for a in auto:
             if len(cur)>=min_items: break

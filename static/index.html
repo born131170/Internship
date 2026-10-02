@@ -148,12 +148,38 @@ P07 Повторные мелкие движения (hand_speed &gt; 0.01). P08
 P10 Подъём уголков губ (smile &gt; 0.4). P11 Брови / напряжение губ (browDown &gt; 0.3 или press &gt; 0.2). P12 Направление взгляда (|yc| &gt; 0.2 или pc &gt; 0.2).<br>
 Счётчик индикатора = число СОБЫТИЙ (эпизодов): склейка зазоров ≤0.4 c, минимум 0.6 c.
 </div></div>
-<div class="syscard"><h3>Каналы измерений</h3><div class="lbl">
-Мимика: smile, frown, browUp, browDown, eyeWide, blink, jawO, noseW, press (blendshapes MediaPipe).<br>
-Голова: yaw/pitch — углы; yc/pc — отклонения от бегущей медианы базовой позы.<br>
-Руки/поза: hand_speed — скорость запястий; aperture — раскрытость кисти; hfd — 3D запястье→голова (ширины плеч); hfd2 — кончики пальцев→нос (ширины лица); tif — кончик пальца внутри бокса лица ×1.30 (0/1); menergy — динамика позы.<br>
-Аудио: rms — громкость; speech — факт речи; f0 — тон голоса; srate — слоги/с; pause — длительность тишины; voicemo — эмоция голоса (0 нейтрально, 1 радость, 2 гнев, 3 печаль, 4 страх).<br>
-Полосы дашборд-видео: VAD, EMO, DYN, HEAD, HANDS, SPCH, VEMO (приглушённый неон); веб-графиков в интерфейсе нет.
+<div class="syscard"><h3>Каналы измерений — подробные определения (единицы, способ расчёта, научная база)</h3><div class="lbl">
+<b>Мимика (MediaPipe Face Blendshapes = коэффициенты 0..1 из системы FACS Экмана–Фризена, Ekman &amp; Friesen, 1978):</b><br>
+<b>smile</b> — максимум из mouthSmileLeft/Right: подъём уголков губ (AU12, Action Unit 12). 0 = покой, 1 = максимальная улыбка. Маркер позитивного аффекта (Fridson, 1994).<br>
+<b>frown</b> — максимум mouthFrownLeft/Right: опущенные уголки губ (AU15). Маркер печали/негативного аффекта.<br>
+<b>browUp</b> — browInnerUp: внутренний подъём бровей (AU1+2). Маркер удивления/горя; также ключевой элемент «маски боли» и признак когнитивной нагрузки.<br>
+<b>browDown</b> — максимум browDownLeft/Right: сведение/опускание бровей (AU4). Маркер гнева и концентрации; компонент индекса напряжения.<br>
+<b>eyeWide</b> — максимум eyeWideLeft/Right: раскрытие глазной щели (AU5+7). Маркер страха/удивления, гипервозбуждения.<br>
+<b>blink</b> — максимум eyeBlinkLeft/Right: смыкание век (AU45+46). Порог события &gt;0.6. Частота моргания 15–25 в минуту в покое; отклонения связаны с дофаминергической активностью и когнитивной нагрузкой (Bentivoglio et al., 1994).<br>
+<b>jawO</b> — jawOpen (AU26): раскрытие челюсти; компонент удивления (вместе с browUp+eyeWide), также вокализация/артикуляция.<br>
+<b>noseW</b> — noseWrinkle (AU9): сморщенный нос — канонический маркер отвращения (Ekman, 1992).<br>
+<b>press</b> — максимум mouthPressLeft/Right (AU24): сжатые/поджатые губы — маркер сдерживания, подавления эмоции, напряжения; входит в индекс tension.<br>
+<b>cheek</b> — cheekRaise (AU6, orbicularis oculi): поднятие щеки. В связке smile&gt;0.35 И cheek&gt;0.15 даёт <b>P10D Duchenne-улыбку</b> — «искреннюю» улыбку с вовлечением круговой мышцы глаза (Ekman &amp; Davidson, 1994).<br>
+<b>Голова:</b><br>
+<b>yaw / pitch</b> — абсолютные углы наклона/поворота головы (радианы), вычисленные по 468 точкам лица (нос относительно центра глаз).<br>
+<b>yc</b> — отклонение yaw от бегущей медианы базовой позы (окно 1400 кадров): «сколько человек отвернул голову/взгляд от нормы». |yc|&gt;35° = паттерн P12 «отведение взгляда» (Kleinke, 1986: избегание зрительного контакта).<br>
+<b>pc</b> — то же для pitch: наклон головы вверх/вниз. Ритмичные pcРитмичные pc&gt;0.08 = кивки (P02);_std(pc) — мобильность головыgt;0.08 = кивки (P02); std(pc) — мобильность головы (Bevc et al., 2001: head movement и правдивость).<br>
+<b>Руки и поза (MediaPipe Pose + Hand):</b><br>
+<b>hand_speed</b> — нормированная скорость запястий между кадрами (расстояние / ширина плеч). &gt;0.03 = жест (P04, иллюстративные жесты по Голдину-Мид), &gt;0.1 = размашистый жест (P05), &gt;0.01 стабильно = fidgeting (P07, мелкая моторная активность при тревоге — Gross &amp; Gerstner, 1998).<br>
+<b>aperture</b> — «раскрытость кисти»: средний радиус пальцев от центра ладони, нормированный. &lt;0.8 = сжатая/закрытая кисть (P08) — маркер сдержанности/напряжения (Mehrabian, 1972).<br>
+<b>hfd</b> — расстояние 3D «запястье → центр головы», делённое на ширину плеч. &lt;0.8 = рука у головы (адаптивное самоуспокаивающее касание лица — Kaitz et al., 2007; Vismara et al., 2016).<br>
+<b>hfd2</b> — расстояние 2D «кончики пальцев (4/8/12/16/20) → кончик носа», делённое на ширину лица. Уточняющий признак касания лица (устойчив к ракурсу).<br>
+<b>tif</b> — бинарный индикатор (0/1): кончик пальца внутри расширенного bounding box лица (×1.30). Основной триггер P06 «рука у лица»; телефон у уха отсеивается гибрид-правилом с hfd.<br>
+<b>menergy</b> — средняя энергия изменения позы между кадрами (сумма квадратов перемещений точек скелета, нормированная). Порог &gt;0.02 = смена позы (P09); частые смены позы — маркер нервозности/дискомфорта (Mehrabian, 1968).<br>
+<b>Аудио (извлечение f0 autocorrelation, VAD по RMS):</b><br>
+<b>rms</b> — root mean square громкости сегмента окна (линейная амплитуда, 0..1). Порог речи = percentile30·1.6.<br>
+<b>speech</b> — бинарно: активна ли речь в окне (VAD). Основа speech_ratio (доля времени со речью).<br>
+<b>f0</b> — основная частота голоса (Гц), автокорреляция в диапазоне 70–400 Гц. Средний диапазон: мужской 85–180 Гц, женский 165–255 Гц (Titze, 1994). f0_std (вариация тона) — маркер эмоциональной экспрессивности; рост f0 — стресс (Scherer, 2003).<br>
+<b>srate</b> — темп речи: число пиков энергии речи за скользящее окно 2 с (≈ слоги/секунду). Норма русской речи ~3.5–5 слогов/с; ускорение — возбуждение/дезингибирование, замедление — депрессия/когнитивная нагрузка (Scherer, 1979; Vrij, 2008 — latency и паузы как индикаторы обмана).<br>
+<b>pause</b> — текущая длительность непрерывной тишины (сек). Паузы ≥0.5 c = P14: когнитивная нагрузка при конструировании ответа (Goldman-Eisler, 1968; Vrij et al., 2017).<br>
+<b>voicemo</b> — эмоция голоса по z-отклонениям громкости (E) и тона (F) в речи: 0 нейтрально, 1 радость (громко+высокий тон), 2 гнев (громко+низкий тон), 3 печаль (тихо+низкий тон), 4 страх (высокий тон). Упрощённая адаптация правил парalingвистики Scherer (2003).<br>
+<b>face_conf / pose_conf</b> — средние visibility-веса landmarks MediaPipe (0..1): качество детекции лица/позы в кадре; низкие значения исключаются из агрегатов.<br><br>
+Полосы дашборд-видео: VAD (активность лица), EMO (эмоция), DYN (динамика тела), HEAD (углы головы), HANDS (руки), SPCH (речь), VEMO (голос-эмоция).
 </div></div>
 <div class="syscard"><h3>Поиск идентичных эпизодов: цепь v4</h3><div class="lbl">
 Stride — обработка каждого N-го кадра; задаёт сетку таймстампов метрик.<br>
@@ -168,7 +194,17 @@ Stride — обработка каждого N-го кадра; задаёт с�
 Эпизод — интервал активности паттерна со скрин-кадром и клипом. Цифровой слепок — шаблон жеста/эмоции для поиска.
 Evidence — цитируемые моделью эпизоды, сверяемые с раскадровкой (анти-галлюцинации). Confidence — достоверность вывода 0..1.
 Эвристика правдивости — невербальный приор (формула передаётся модели в evidence). LLM/API — внешняя модель через OpenAI-совместимый эндпоинт.
-Shrinkage — заполнение блока без скорингов популяционной нормой (50 / 50-50 / 25×4) с предупреждением, вместо прочерков.
+Shrinkage — заполнение блока без скорингов популяционной нормой (50 / 50-50 / 25×4) с предупреждением, вместо прочерков.<br>
+<b>LR (likelihood ratio, отношение правдоподобия)</b> — во сколько раз измеренное значение индикатора повышает (LR&gt;1, «за») или понижает (LR&lt;1, «против») шансы черты; агрегация черт Big Five = логистический перенос суммы ln(LR) в шкалу 0..100. Пороговые LR калиброваны по мета-аналитическим размерам эффекта (см. psychometrics.NORM_SOURCES).<br>
+<b>CI95 (95% доверительный интервал)</b> — диапазон, в котором с вероятностью 95% лежит истинная оценка черты; рассчитывается бутстрапом по эпизодам. Широкий CI = мало данных/низкая репрезентативность.<br>
+<b>Tier (уровень доказательства)</b> — сила индикатора: strong (прямая мета-аналитическая связь), moderate (устойчивая корреляция), weak (косвенный маркер). Индикаторы tier=weak имеют ограниченный вес в LR-сумме.<br>
+<b>n_indicators</b> — число независимых индикаторов, вошедших в оценку черты; при n&lt;3 оценка помечается low_data.<br>
+<b>Duchenne-улыбка (AU6+AU12)</b> — улыбка с непроизвольным сокращением круговой мышцы глаза; единственный мимический маркер с валидированной связью с позитивным аффектом (Ekman &amp; Davidson, 1994).<br>
+<b>tension (индекс напряжения)</b> — доля времени с browDown&gt;0.3 или press&gt;0.2 (AU4/AU24) — операционализация конструкта мышечного напряжения (Cacioppo et al., 2000).<br>
+<b>avoidance_ratio</b> — доля времени с |yc|&gt;35° (отведение головы/взгляда от медианы) — операционализация gaze avoidance (Kleinke, 1986).<br>
+<b>speech_ratio</b> — доля длительности видео с активной речью (VAD); <b>hand_face_ratio</b> — частота касаний лица на минуту (adaptors, Kaitz et al., 2007).<br>
+<b>coverage</b> — доля каналов метрик с ненулевыми данными (0..1): низкая coverage = видео плохого качества, оценки снижаются к норме.<br>
+<b>Фоновый режим LLM</b> — POST /llm/analyze мгновенно возвращает «started», сервер считает в отдельном потоке, браузер опрашивает GET /llm/status каждые 3 c; таймаут HTTP-запроса к API модели настраивается переменной окружения LLM_TIMEOUT (по умолчанию 180 c).
 </div></div>
 <div class="syscard"><h3>Системы личности</h3><div class="lbl">
 Big Five (OCEAN) — 5 факторов 0..100. MBTI — оси E/I, S/N, T/F, J/P (&gt;50 = полюс). Эннеаграмма — 9 типов с крылом.
@@ -319,11 +355,24 @@ async function runLLM(){ if(!VID){ try{ if(!await loadLatest()) return alert("Н
     return alert("LLM не настроен: укажите Base URL, API key и модель, затем «Проверить»."); }
   $("#anState").innerHTML=SPIN+"LLM думает…"; $("#runState").innerHTML=SPIN+"LLM думает…";
   try{
-    const r=await api(`/api/videos/${VID}/llm/analyze`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:$("#prompt").value})});
+    await api(`/api/videos/${VID}/llm/analyze`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:$("#prompt").value})});
+  }catch(e){ RESULT=null; renderAnalysis(); const m="ошибка LLM-анализа: "+errText(e); $("#anState").textContent=m; $("#runState").textContent=m; return; }
+  // фоновый режим: опрос статуса каждые 3 с (не зависит от таймаута браузера/прокси)
+  const t0=Date.now();
+  while(true){
+    await new Promise(r=>setTimeout(r,3000));
+    let s; try{ s=await api(`/api/videos/${VID}/llm/status`); }catch(e){ continue; } // сеть мигала — продолжаем опрос
+    if(s.state==="running"||s.state==="queued"){
+      const el=Math.round((Date.now()-t0)/1000);
+      const msg=`${SPIN}LLM думает… ${el} c${s.msg?" · "+s.msg:""}`;
+      $("#anState").innerHTML=msg; $("#runState").innerHTML=msg; continue; }
+    if(s.state==="error"){ RESULT=null; renderAnalysis(); const m="ошибка LLM-анализа: "+(s.error||"неизвестно"); $("#anState").textContent=m; $("#runState").textContent=m; return; }
+    const r=s.result||{raw:"",parsed:null,warnings:["нет результата"],scores:null};
     RESULT=r; $("#rawOut").textContent=r.raw; renderAnalysis(); setLLMChip(true,st.model);
     $("#anState").textContent="готово"+((r.warnings||[]).length?`, предупреждений: ${r.warnings.length}`:""); $("#runState").textContent="готово";
     renderTruth(await api(`/api/videos/${VID}/truth`));
-  }catch(e){ RESULT=null; renderAnalysis(); const m="ошибка LLM-анализа: "+errText(e); $("#anState").textContent=m; $("#runState").textContent=m; }}
+    return;
+  }}
 $("#btnGoLLM").onclick=runLLM; $("#btnRun").onclick=runLLM;
 $("#btnSaveJson").onclick=()=>{ if(!RESULT) return alert("Нет LLM-анализа — сохранять нечего");
   const blob=new Blob([JSON.stringify({video:VID,exported:new Date().toISOString(),summary:SUM,result:RESULT},null,1)],{type:"application/json"});
@@ -401,7 +450,8 @@ $("#btnSearch").onclick=async()=>{ let target=SEARCH_VID||VID;
    $("#resList").innerHTML=(r.results||[]).map((x,i)=>`<div class="ep"><div class="b">#${i+1} <span class="tc">${fmt(x.t0)}–${fmt(x.t1)}</span><br>${x.pattern?`<span class="tag">${x.pattern}</span>`:""}distance: <b>${x.distance}</b><br>
     <button class="btn sec" onclick="jumpT(${x.t0})">▶ показать</button></div></div>`).join("")||"<span class='lbl'>ничего не найдено</span>";
    const m=r.meta||{};
-   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Эпизодов паттерна в видео: "+(m.total!=null?m.total:(r.results||[]).length)+" (равно счётчику индикаторов при множителе 1.0); показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."; }
+   const modeNote=m.mode==="free"?" (скользящее окно: эпизоды паттерна не сегментировались)":(m.total===0?" — эпизодов паттерна в этом видео нет":"");
+   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+modeNote; }
   catch(e){ alert("Ошибка поиска: "+errText(e)); } };
 window.jumpT=t=>{ const sv=$("#searchVideo");
   if(SEARCH_VID && !$("#extCard").hidden){ sv.currentTime=t; sv.play(); }
