@@ -1,6 +1,6 @@
 """LLM v4.1: детерминированный скоринг копируется из scores_block, отказ невозможен."""
 from __future__ import annotations
-import json, re
+import json, os, re
 from pathlib import Path
 import httpx
 
@@ -82,11 +82,17 @@ def _as_text(c) -> str:
         return "".join(out)
     return json.dumps(c,ensure_ascii=False)
 
-def chat(cfg: dict, messages: list, timeout=90):
+DEFAULT_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "180"))  # настраивается через env или cfg["timeout"]
+
+def chat(cfg: dict, messages: list, timeout=None):
     url=cfg["base_url"].rstrip("/")+"/chat/completions"
     headers={"Authorization":f"Bearer {cfg.get('api_key','')}"}
     payload={"model":cfg.get("model"),"temperature":cfg.get("temperature",0.3),"messages":messages}
-    r=httpx.post(url,json=payload,headers=headers,timeout=timeout)
+    to=float(timeout or cfg.get("timeout") or DEFAULT_TIMEOUT)
+    try:
+        r=httpx.post(url,json=payload,headers=headers,timeout=to)
+    except httpx.TimeoutException as e:
+        raise type(e)(f"Таймаут запроса к API ({int(to)} c)") from e
     r.raise_for_status()
     data=r.json()
     msg=None; fr=""
@@ -200,7 +206,7 @@ def build_evidence(summary: dict, max_episodes=40):
     eps=summary.get("episodes",[])
     counts={}
     for e in eps: counts[e["pattern"]]=counts.get(e["pattern"],0)+1
-    return {"video":{"duration_sec":summary["duration_sec"],"fps":summary["fps"],"frames":summary["n_frames"]},
+    evidence={"video":{"duration_sec":summary["duration_sec"],"fps":summary["fps"],"frames":summary["n_frames"]},
             "pattern_counters":summary["counters"],"pattern_events":summary["events"],
             "pattern_names":summary["pattern_names"],"stats":summary["stats"],
             "emotion_distribution":summary["emotions"],"truth_cues":summary["truth_cues"],
@@ -239,7 +245,18 @@ def _force_format(cite_cap: int) -> str:
         base+=" В evidence всех систем верни пустые списки: только scores, summary, truthfulness."
     return base
 
-def run_analysis(cfg: dict, user_prompt: str, evidence: dict, cite_cap: int=6):
+def run_analysis(cfg: dict, user_prompt: str, evidence: dict, cite_cap: int=6, retries: int=2):
+    """Запрос к LLM с внутренними автоповторами на сетевые ошибки/таймауты."""
+    import time as _t
     msgs=[{"role":"system","content":SYSTEM_PROMPT},
           {"role":"user","content":(user_prompt or DEFAULT_USER_PROMPT)+_force_format(cite_cap)+"\n\nEVIDENCE JSON:\n"+json.dumps(evidence,ensure_ascii=False)}]
-    return chat(cfg,msgs)
+    last=None
+    for attempt in range(retries+1):
+        try:
+            return chat(cfg,msgs)
+        except Exception as e:
+            last=e
+            if attempt<retries and is_retriable(e):
+                _t.sleep(1.5*(attempt+1)); continue
+            raise
+    raise last

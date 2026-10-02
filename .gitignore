@@ -1,1 +1,6 @@
+# Compiled/Binary files
 __pycache__/
+*.pyc
+
+# Common compressed file
+*.zip
