@@ -7,3 +7,9 @@ opencv-python>=4.9
 mediapipe>=0.10.14
 imageio-ffmpeg>=0.6
 python-pptx>=1.0
+
+# Системные зависимости (headless Linux/Docker) — MediaPipe грузит OpenGL нативно:
+#   Debian/Ubuntu:  apt-get update && apt-get install -y libegl1 libgles2 libgl1
+#   Fedora/RHEL:    dnf install -y mesa-libEGL mesa-libGLES mesa-libGL
+#   Alpine:         apk add mesa-egl mesa-gles mesa-gl eudev
+# python run.py проверяет их наличие и ставит автоматически при правах root.
