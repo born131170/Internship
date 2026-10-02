@@ -282,6 +282,16 @@ const SYS=[["big_five","Big Five (OCEAN)",p=>[["Openness",p.openness],["Conscien
  ["hexaco","HEXACO",p=>[["H",p.H],["E",p.E],["X",p.X],["A",p.A],["C",p.C],["O",p.O]]],
  ["pid5","PID-5 (DSM-5)",p=>[["Neg. affect",p.negative_affect],["Detachment",p.detachment],["Antagonism",p.antagonism],["Disinhibition",p.disinhibition],["Psychoticism",p.psychoticism]]]];
 const epById=id=>SUM&&SUM.episodes.find(e=>e.id===id);
+function psychEvHtml(trait){
+  // детерминированные кадры-доказательства из локального MediaPipe-слоя (без LLM):
+  // реальные скрин-кадры эпизодов видео, где наблюдался индикатор данной черты
+  const det=SUM&&SUM.personality&&SUM.personality.big_five&&SUM.personality.big_five._detail;
+  const ev=det&&det[trait]&&det[trait].evidence_frames;
+  if(!ev||!ev.length) return "";
+  return `<div class="lbl" style="margin-top:8px">Кадры-доказательства (локальный движок MediaPipe):</div><div class="grid">`+
+    ev.map(e=>{const ep=epById(e.episode_id);
+      return `<div class="ep">${ep?`<img src="/api/videos/${VID}/file?path=${ep.thumb}">`:""}<div class="b"><span class="tc">${e.t0.toFixed(1)}–${e.t1.toFixed(1)}с</span> · ${PNAMES[e.pattern]||e.pattern} · <b>${e.direction}</b> (${e.var}=${typeof e.value==="number"?e.value.toFixed(3):e.value}, LR=${e.lr})<br><span class="lbl">${e.note||""}</span></div></div>`;}).join("")+"</div>";
+}
 function renderAnalysis(){const p=RESULT&&RESULT.parsed; const sc=(RESULT&&RESULT.scores)||window.SCORES||null;
   const w=(RESULT&&RESULT.warnings)||[];
   const top=(sc||p)?`<div class="syscard"><h3>Заключение</h3>${p&&p.summary?p.summary:"Детерминированный поведенческий скоринг v1 по метрикам MediaPipe: формулы открыты (глоссарий, экспорт .json). LLM-нарратив не подключён."} <span class="tag">${sc?"детерминированный скоринг v1":"—"}</span>${p?` <span class="tag">LLM confidence ${(p.confidence??0).toFixed(2)}</span>`:""}${p&&p.disclaimer?`<div class="lbl" style="margin-top:6px">${p.disclaimer}</div>`:""}</div>`:"";
@@ -296,7 +306,12 @@ function renderAnalysis(){const p=RESULT&&RESULT.parsed; const sc=(RESULT&&RESUL
       ? ev.map(e=>{const ep=epById(e.episode_id);
           return `<div class="ep">${ep?`<img src="/api/videos/${VID}/file?path=${ep.thumb}">`:""}<div class="b"><span class="tc">${e.timecode||""}</span> ${ep?"· "+(PNAMES[ep.pattern]||ep.name):""}<br>${e.rationale||""}</div></div>`;}).join("")
       : `<span class="lbl">${p?"модель не указала доказательства":"доказательства появятся после LLM-анализа"}</span>`;
-    return `<div class="syscard"><h3>${t} ${d?(head?`<span class="tag">${head(d)}</span>`:`<span class="tag">данные получены</span>`):`<span class="tag" style="opacity:.5">ждём данных</span>`}${d&&d._reliable===false?'<span class="tag">ненадёжно</span>':""}</h3>${rows}${dn&&dn.notes?`<div class="lbl" style="margin:6px 0">${dn.notes}</div>`:""}<div class="grid" style="margin-top:8px">${evHtml}</div></div>`;
+    const psychDet = k==="big_five" ? (SUM&&SUM.personality&&SUM.personality.big_five&&SUM.personality.big_five._detail)||null : null;
+    const TRU={extraversion:"Экстраверсия",agreeableness:"Доброжелательность",conscientiousness:"Добросовестность",neuroticism:"Нейротизм",openness:"Открытость"};
+    const psychBars = psychDet ? Object.entries(psychDet).filter(([tt,v])=>v&&typeof v.score==="number")
+        .map(([tt,v])=>`<div class="sb"><span>${TRU[tt]||tt} <i class="lbl">(локально, CI ${v.ci95?v.ci95[0]+"–"+v.ci95[1]:"—"})</i></span><span class="t"><i style="width:${v.score}%"></i></span><b>${Math.round(v.score)}</b></div>`).join("") : "";
+    const psychEvs = psychDet ? ["extraversion","agreeableness","conscientiousness","neuroticism","openness"].map(tt=>psychEvHtml(tt)).join("") : "";
+    return `<div class="syscard"><h3>${t} ${d?(head?`<span class="tag">${head(d)}</span>`:`<span class="tag">данные получены</span>`):`<span class="tag" style="opacity:.5">ждём данных</span>`}${d&&d._reliable===false?'<span class="tag">ненадёжно</span>':""}</h3>${rows}${dn&&dn.notes?`<div class="lbl" style="margin:6px 0">${dn.notes}</div>`:""}${k==="big_five"&&psychBars?`<div class="lbl" style="margin-top:8px"><b>Локальный движок MediaPipe — детерминированная LR-агрегация (без LLM):</b></div>${psychBars}`:""}<div class="grid" style="margin-top:8px">${evHtml}</div>${psychEvs}</div>`;
   }).join("");}
 async function runLLM(){ if(!VID){ try{ if(!await loadLatest()) return alert("Нет завершённых анализов на диске"); }catch(e){ return alert(errText(e)); } }
   let st; try{ st=await api("/api/llm/status"); }catch(e){ return alert(errText(e)); }
