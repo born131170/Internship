@@ -192,6 +192,63 @@ def _episodes_of_pattern(mask,b,fps_proc):
     if st is not None: ints.append([st,last])
     return [ints[k] for k in range(len(ints)) if ints[k][1]-ints[k][0]>=MIN]
 
+def _spans_by_activity(records,mask,chans,fps_proc,dur_s,min_frac=0.15,max_mult=3.0):
+    """Сплайсинг длинного окна на отдельные ЭПИЗОДЫ по локальной активности каналов слепка.
+
+    Исправляет «одно окно 53 с вместо трёх эпизодов по 1–2 с»: раньше в режиме free
+    окно всегда равнялось полной длительности слепка. Теперь внутри скользящего окна
+    ищем сегменты с аномальной активностью (z-score > 1 по |diff| или std канала),
+    склеиваем их с окном ±0.4 с и отдаём как независимые кандидаты. Если выраженных
+    всплесков нет — возвращаем исходное окно целиком (честно, без выдумывания)."""
+    W=max(3,int(round(dur_s*fps_proc)))
+    pad=int(round(0.4*fps_proc))
+    lo_cut=min(1.0,0.35*dur_s); hi_cut=max(2.0,2.0*dur_s)
+    out=[]
+    for start in range(0,max(1,len(records)-W+1)):
+        win=records[start:start+W]
+        mseg=mask[start:start+W]
+        segs=[]
+        for c in chans:
+            v=np.array([r.get(c,float("nan")) for r in win],dtype=float)
+            ok=~np.isnan(v)
+            if ok.sum()<max(3,int(0.3*len(v))): continue
+            vv=v[ok]; idx=np.where(ok)[0]
+            d=np.abs(np.diff(vv)); s=float(np.nanstd(vv))
+            med_d=float(np.median(d)); mad_d=float(np.median(np.abs(d-med_d))) or 1e-9
+            z_thr=med_d+3.0*mad_d
+            act=(d>max(z_thr,s))|(d>2.0*med_d)
+            hits=[int(idx[i]) for i in range(len(act)) if bool(act[i])]
+            cur=None; last_i=-10
+            for h in hits:
+                if cur is None: cur=[h,h]
+                elif h-last_i<=2*pad: cur[1]=h
+                else: segs.append(tuple(cur)); cur=[h,h]
+                last_i=h
+            if cur is not None: segs.append(tuple(cur))
+        merged=[]
+        for a,b in sorted(segs):
+            a2=max(0,a-pad); b2=min(W-1,b+pad)
+            if merged and a2<=merged[-1][1]+1: merged[-1]=(merged[-1][0],max(merged[-1][1],b2))
+            else: merged.append((a2,b2))
+        # фильтр по длительности эпизода: не короче min(lo_cut, 0.3·dur) и не длиннее max(hi_cut, dur)
+        min_len=max(2,int(round(min(lo_cut,0.3*dur_s)*fps_proc)))
+        max_len=max(min_len+1,int(round(max(hi_cut,dur_s)*fps_proc)))
+        frac_ok=int(round(min_frac*W))
+        for a2,b2 in merged:
+            if b2-a2+1<min_len: continue
+            if b2-a2+1>max_len: continue
+            if sum(bool(mseg[i]) for i in range(a2,b2+1))<frac_ok: continue
+            out.append((start+a2,start+b2))
+    # дедупликация перекрывающихся спанов (окна с шагом 1 кадр дают ~дублей)
+    uniq=[]
+    for a,b in sorted(set(out)):
+        if uniq and a<=uniq[-1][1]: continue
+        uniq.append((a,b))
+    if not uniq:
+        for start in range(0,max(1,len(records)-W+1)):
+            uniq.append((start,start+W-1))
+    return uniq[:800]
+
 def _morph_ok(win,S_c,dur_s,fps_proc):
     """Морфологическая проверка формы кривой окна против слепка (аффинно-инвариантно)."""
     v=np.asarray([x for x in win if not _isnan(x)],dtype=float)
@@ -292,6 +349,17 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         # strict_ft + нет P06-эпизодов в видео: active остаётся = [P06] -> eps=[],
         # честный ответ 0 находок (см. ниже), без скатывания в free-скольжение
     b=active[0]; pid=PAT_DEFS[b][0]
+    # ЯВНЫЙ выбор целевого паттерна пользователем (payload.pattern): пересчёт доли
+    # активности этого паттерна в окне слепка. Без этого длинный слепок (несколько
+    # жестов в одном окне) выбирал шумовой P07 вместо осмысленного P06, и поиск
+    # возвращал произвольные 20-секундные окна вместо реальных эпизодов жеста.
+    if pattern:
+        sel=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]==pattern]
+        if sel:
+            b=sel[0]; pid=PAT_DEFS[b][0]
+            frac={x:float(np.mean((winmask>>x)&1==1)) for x in active}
+            frac[b]=float(np.mean((winmask>>b)&1==1)) if len(winmask) else 1.0
+            active=[b]
     eps=_episodes_of_pattern(mask,b,fps_proc)
     if strict_ft:
         # в строгом режиме не скатываемся в free-скольжение: если P06-эпизодов нет,
@@ -301,12 +369,17 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         mode=mode or ("episodes" if eps else "free")
     cands=[]
     if mode=="free":
-        # скользящее окно без привязки к паттерну: работает всегда, даже когда
-        # пороговый паттерн в целевом видео не сегментируется на эпизоды
+        # скользящее окно + СПЛАЙСИНГ по активности: длинное окно (например слепок
+        # 53 с) режется на отдельные эпизоды-всплески по локальной активности каналов
+        # слепка — иначе пользователь получает «1 находка = всё видео», хотя внутри
+        # окна несколько коротких жестов по 1–2 с
         W=max(3,int(round(dur_s*fps_proc)))
         step=max(1,int(round(float(hop or 0.25)*fps_proc)))
-        starts=list(range(0,max(1,len(records)-W+1),step)) or [0]
-        spans=[(s,min(len(records)-1,s+W-1)) for s in starts]
+        spans=_spans_by_activity(records,mask,chans,fps_proc,dur_s)
+        # если сплайсинг вернул окна целиком (нет всплесков) — оставляем обычную сетку
+        if not spans:
+            starts=list(range(0,max(1,len(records)-W+1),step)) or [0]
+            spans=[(s,min(len(records)-1,s+W-1)) for s in starts]
     else:
         spans=[tuple(e) for e in eps]
     for k,(a,bb) in enumerate(spans):
@@ -323,10 +396,11 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
             v=np.array([r.get(c,float("nan")) for r in win],dtype=float)
             if len(v)==0 or np.all(np.isnan(v)): continue
             cs=_znorm(_resample(v))
-            de=float(np.sqrt(np.mean((cs-S[c])**2)))
-            dd=dtw_dist(cs,S[c])
+            Sc=_znorm(_resample(S[c]))   # эталон слепка тоже к N точкам: иначе broadcast-краш
+            de=float(np.sqrt(np.mean((cs-Sc)**2)))
+            dd=dtw_dist(cs,Sc)
             d+=0.3*de+0.7*dd; ok+=1
-            if not _morph_ok(v,S[c],dur_s,fps_proc): morph_fail=True
+            if not _morph_ok(v,Sc,dur_s,fps_proc): morph_fail=True
         if ok==0: continue
         if face_touch and morph_fail: continue   # строгий режим: форма кривой обязательна
         ft_frac=None

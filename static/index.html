@@ -113,7 +113,7 @@ pre.out{background:#0d1220;border:1px solid #223;border-radius:10px;padding:12px
   <div class="card"><h2>Сохранённые слепки <span id="snapCount" class="tag"></span></h2>
     <div id="snapList" class="grid" style="max-height:300px;overflow:auto"></div>
     <div class="row" style="margin-top:10px"><input type="file" id="snapFile" accept=".json,application/json"><button class="btn sec" id="btnSnapUp">Загрузить слепок на сервер</button><span class="lbl" id="upMsg"></span></div></div></section>
-<section id="p-search" hidden><h1>Поиск идентичных эпизодов</h1><div class="sub">Сегментация эпизодов → целевой паттерн (редчайший активный в слепке) → z-norm → 0.3·Euclid + 0.7·DTW + штраф длительности → ранжирование. Искать можно в текущем или в стороннем видео.</div>
+<section id="p-search" hidden><h1>Поиск идентичных эпизодов</h1><div class="sub">Поиск по видео окон, похожих на сохранённый цифровой слепок жеста/эмоции. Искать можно в текущем или в стороннем видео.</div>
   <div class="card row"><select id="snapSel"></select><input id="topk" type="number" value="100" style="width:70px">
     <button class="btn" id="btnSearch">Найти</button>
     <label class="btn sec" style="cursor:pointer">📄 Слепок с диска<input type="file" id="diskSnap" accept=".json" hidden></label>
@@ -316,13 +316,15 @@ function syncLeds(){ if(!PATS||!PATS.length) return; const dv=$("#dashVideo"); c
 setInterval(()=>{ if(!$("#dashCard").hidden) syncLeds(); },250);
 const CUE_NAMES={blink_per_min:"Морганий в минуту (норма 15–25, Bentivoglio 1994)",smile_ratio:"Доля кадров с улыбкой (AU12, FACS)",tension_ratio:"Доля кадров напряжения мимики (AU4/AU23, P11)",avoidance_ratio:"Доля кадров отведения взгляда >35° (P12, Kleinke 1986)",hand_face_ratio:"Доля кадров касания лица рукой (adaptors, P06, Kaitz 2007)",hand_activity_ratio:"Доля кадровой мелкой моторной активности рук (P07)",head_yaw_std:"Стандартное отклонение поворота головы (рад)",head_pitch_std:"Стандартное отклонение наклона головы (рад)",speech_ratio:"Доля времени с речью",pause_per_min:"Пауз ≥0.5 c в минуту речи",speech_rate_syll_per_sec:"Темп речи, слогов/с (норма 3.5–5)",voice_f0_std_hz:"Вариабельность основного тона, Гц"};
 function renderTruth(tr){ const g=$("#gauge"), cl=$("#cueList");
+  if(tr) window.TRUTH_DATA=tr;   // серверный снимок /truth (включая llm_verdict из llm_result.json)
   if(tr){ g.style.setProperty("--v",tr.heuristic); g.textContent=tr.heuristic;
     const entries=Object.entries(tr.cues||{}).map(([k,v])=>`<li><b>${CUE_NAMES[k]||k}</b>: ${typeof v==="number"?+v.toFixed(3):String(v)}</li>`).join("");
     const psy=tr.psych?`<div class="lbl" style="margin-top:6px">Индекс нагрузки по валидированным маркерам движка: <b>${Math.round(tr.psych.score)}/100</b>${tr.psych.n_indicators!=null?" · индикаторов: "+tr.psych.n_indicators:""}${tr.psych.note?" · "+tr.psych.note:""}</div>`:"";
     cl.innerHTML=`<div class="lbl">Эвристика MediaPipe (без LLM): ${tr.heuristic}/100 — приор маркеров нагрузки/утечки, НЕ вероятность лжи (Vrij & Stockwell 2023)</div><ul>${entries||"<span class='lbl'>нет cue-метрики</span>"}</ul>${psy}`; }
   else { g.style.setProperty("--v",0); g.textContent="–";
     cl.innerHTML=`<span class="lbl">нет данных — загрузите видео или нажмите «Открыть последний анализ» (сессия сброшена перезагрузкой страницы)</span>`; }
-  const t=RESULT&&RESULT.parsed&&RESULT.parsed.truthfulness;
+  const t=(RESULT&&RESULT.parsed&&RESULT.parsed.truthfulness)
+        || (window.TRUTH_DATA&&window.TRUTH_DATA.llm_verdict);  // серверный источник: llm_result.json на диске
   $("#llmTruthBody").innerHTML = t
     ? `<b>Score: ${t.score}/100</b> — ${t.verdict||""}<ul>`+(t.cues||[]).map(c=>`<li>${c.cue} <span class="lbl">(${c.direction||""})</span></li>`).join("")+"</ul>"
     : (window.SCORES&&window.SCORES.truthfulness
