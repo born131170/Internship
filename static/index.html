@@ -325,11 +325,19 @@ function renderTruth(tr){ const g=$("#gauge"), cl=$("#cueList");
     cl.innerHTML=`<span class="lbl">нет данных — загрузите видео или нажмите «Открыть последний анализ» (сессия сброшена перезагрузкой страницы)</span>`; }
   const t=(RESULT&&RESULT.parsed&&RESULT.parsed.truthfulness)
         || (window.TRUTH_DATA&&window.TRUTH_DATA.llm_verdict);  // серверный источник: llm_result.json на диске
-  $("#llmTruthBody").innerHTML = t
-    ? `<b>Score: ${t.score}/100</b> — ${t.verdict||""}<ul>`+(t.cues||[]).map(c=>`<li>${c.cue} <span class="lbl">(${c.direction||""})</span></li>`).join("")+"</ul>"
-    : (window.SCORES&&window.SCORES.truthfulness
-      ? `<div class="lbl">LLM-анализ не запускался. Детерминированная эвристика MediaPipe:</div><b>${window.SCORES.truthfulness.score}/100</b> — ${window.SCORES.truthfulness.verdict||"невербальный приор нагрузки/утечки (не вероятность лжи)"}`
-      : `<span class="lbl">ожидает LLM-анализа</span>`);}
+  if(t){
+    const sc=(typeof t.score==="number")?t.score:"—";
+    const vd=(t.verdict||"").trim()||"LLM не вернул текст вердикта";
+    // нормализация cues: строка или объект сcue/name/marker — «undefined ()» больше не появится
+    const cl=[]; for(const c of (Array.isArray(t.cues)?t.cues:[])){
+      if(c==null) continue;
+      if(typeof c==="string"){ if(c.trim()) cl.push({cue:c.trim(),direction:""}); }
+      else if(typeof c==="object"){ const nm=String(c.cue||c.name||c.marker||"").trim(); if(nm) cl.push({cue:nm,direction:String(c.direction||c.note||"")}); }
+    }
+    $("#llmTruthBody").innerHTML=`<b>Score: ${sc}/100</b> — ${vd}`+(cl.length?"<ul>"+cl.map(c=>`<li>${c.cue}${c.direction?` <span class="lbl">(${c.direction})</span>`:""}</li>`).join("")+"</ul>":"");
+  } else if(window.SCORES&&window.SCORES.truthfulness){
+    $("#llmTruthBody").innerHTML=`<div class="lbl">LLM-анализ не запускался. Детерминированная эвристика MediaPipe:</div><b>${window.SCORES.truthfulness.score}/100</b> — ${window.SCORES.truthfulness.verdict||"невербальный приор нагрузки/утечки (не вероятность лжи)"}`;
+  } else { $("#llmTruthBody").innerHTML=`<span class="lbl">ожидает LLM-анализа</span>`; }}
 $("#btnTruthReset").onclick=()=>{ RESULT=null; renderTruth(null); renderAnalysis(); };
 const SYS=[["big_five","Big Five (OCEAN)",p=>[["Openness",p.openness],["Conscientiousness",p.conscientiousness],["Extraversion",p.extraversion],["Agreeableness",p.agreeableness],["Neuroticism",p.neuroticism]]],
  ["mbti","MBTI",p=>[["E / I",p.axes?.E_I],["S / N",p.axes?.S_N],["T / F",p.axes?.T_F],["J / P",p.axes?.J_P]],p=>"Тип: "+p.type],

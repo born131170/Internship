@@ -134,9 +134,23 @@ def truth(vid: str):
     try:
         lr=json.loads((_vdir(vid)/"llm_result.json").read_text(encoding="utf-8"))
         t=(lr.get("parsed") or {}).get("truthfulness")
-        if isinstance(t,dict) and isinstance(t.get("score"),(int,float)):
-            out["llm_verdict"]={"score":t["score"],"verdict":t.get("verdict",""),
-                                "cues":[c for c in (t.get("cues") or []) if isinstance(c,dict)]}
+        if isinstance(t,dict):
+            cues=[]
+            for c in (t.get("cues") or []):
+                # нормализация: модель может вернуть строки вместо объектов —
+                # иначе фронтенд печатает «undefined ()» на каждом пункте
+                if isinstance(c,dict):
+                    nm=str(c.get("cue") or c.get("name") or c.get("marker") or "").strip()
+                    dr=str(c.get("direction") or c.get("note") or "").strip()
+                    if nm: cues.append({"cue":nm,"direction":dr})
+                elif isinstance(c,str) and c.strip():
+                    cues.append({"cue":c.strip(),"direction":""})
+            sc=t.get("score")
+            vd=str(t.get("verdict") or "").strip()
+            if isinstance(sc,(int,float)) or vd or cues:
+                out["llm_verdict"]={"score":sc if isinstance(sc,(int,float)) else None,
+                                    "verdict":vd or "LLM вернул только cues без текста вердикта",
+                                    "cues":cues}
     except Exception:
         pass
     return out
@@ -313,12 +327,26 @@ def llm_analyze(vid: str, payload: dict = None):
                 if isinstance(parsed,dict):
                     # честный confidence вместо всегда-нулевого из схемы модели
                     parsed["confidence"]=llm.compute_confidence(parsed,warnings)
-                    # truthfulness.verdict: не оставляем заглушку "ожидает LLM-анализа"
+                    # truthfulness: нормализуем verdict и cues — модель часто
+                    # возвращает пустой текст или cues строками/объектами без поля
+                    # "cue", из-за чего во фронте печаталось «undefined ()»
                     t=parsed.get("truthfulness")
-                    if isinstance(t,dict) and not (t.get("verdict") or "").strip():
-                        sc=scores.get("truthfulness") if isinstance(scores,dict) else None
-                        tv=(sc or {}).get("verdict") if isinstance(sc,dict) else None
-                        t["verdict"]=tv or f"Детерминированная эвристика: {scores.get('truthfulness',{}).get('score','—')}/100 — невербальный приор нагрузки/утечки (не вероятность лжи)"
+                    if isinstance(t,dict):
+                        if not str(t.get("verdict") or "").strip():
+                            sc=scores.get("truthfulness") if isinstance(scores,dict) else None
+                            tv=(sc or {}).get("verdict") if isinstance(sc,dict) else None
+                            t["verdict"]=tv or f"Детерминированная эвристика: {(sc or {}).get('score','—')}/100 — невербальный приор нагрузки/утечки (не вероятность лжи)"
+                        nc=[]
+                        for c in (t.get("cues") or []):
+                            if isinstance(c,dict):
+                                nm=str(c.get("cue") or c.get("name") or c.get("marker") or "").strip()
+                                dr=str(c.get("direction") or c.get("note") or "").strip()
+                                if nm: nc.append({"cue":nm,"direction":dr})
+                            elif isinstance(c,str) and c.strip():
+                                nc.append({"cue":c.strip(),"direction":""})
+                        t["cues"]=nc
+                        if not isinstance(t.get("score"),(int,float)):
+                            t["score"]=(scores.get("truthfulness") or {}).get("score") if isinstance(scores,dict) else None
             result={"raw":raw,"parsed":parsed,"warnings":warnings,"scores":scores}
             (d/"llm_result.json").write_text(json.dumps(result,ensure_ascii=False),encoding="utf-8")
             st.update(state="done",result=result,msg="готово")

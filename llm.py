@@ -214,6 +214,17 @@ def validate_result(parsed: dict, summary: dict):
             t["_reliable"]=False
     tt=parsed.get("truthfulness")
     if isinstance(tt,dict):
+        # нормализация cues ДО детерминированной подстановки: модель может вернуть
+        # строки вместо объектов {"cue","direction"} — фронт печатал «undefined ()»
+        nc=[]
+        for c in (tt.get("cues") or []):
+            if isinstance(c,dict):
+                nm=str(c.get("cue") or c.get("name") or c.get("marker") or "").strip()
+                dr=str(c.get("direction") or c.get("note") or "").strip()
+                if nm: nc.append({"cue":nm,"direction":dr})
+            elif isinstance(c,str) and c.strip():
+                nc.append({"cue":c.strip(),"direction":""})
+        tt["cues"]=nc
         # жёсткая гарантия: score берётся ТОЛЬКО из детерминированного скоринга движка;
         # модель не может привнести своё число (раньше "Score: 50/100" приходил прямо из LLM)
         try:
