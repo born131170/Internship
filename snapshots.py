@@ -72,9 +72,26 @@ def dtw_dist(a,b,band=12):
 
 def _pattern_mask(records):
     out=np.zeros(len(records),dtype=np.int64)
+    # P01 (бит 0) — единый с конвейером детектор морганий (переходы+рефрактерность),
+    # а не сырой порог blink>0.6: при stride-сэмплинге blendshape залипает и raw-порог
+    # даёт вечную активность/0 событий в зависимости от видео.
+    try:
+        from pipeline import blink_events as _be
+        bl=set(_be(records)) if len(records)>3 else set()
+    except Exception:
+        bl=None
     for i in range(len(records)):
         r=records[i]; m=0
         for b in range(len(PAT_DEFS)):
+            pid=PAT_DEFS[b][0]
+            if pid=="P01":
+                if bl is not None:
+                    if i in bl: m|=(1<<b)
+                else:
+                    try:
+                        if PAT_DEFS[b][1](r): m|=(1<<b)
+                    except Exception: pass
+                continue
             try:
                 if PAT_DEFS[b][1](r): m|=(1<<b)
             except Exception: pass
