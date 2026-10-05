@@ -83,10 +83,27 @@ def compute_scores(s):
     used=[smile,tension,avoid,act,men,speech,rate,f0std]
     cov=round(sum(1 for v in used if v not in (None,0))/max(1,len(used)),2)
     ae=auto_evidence(s)
-    return {"big_five":bf,"mbti":mbti,"enneagram":enn,"temperament":temp,"hexaco":hexa,"pid5":pid5,"auto_evidence":ae,
-            "truthfulness":{"score":s.get("truth_heuristic",50),
-                            "verdict":"невербальный приор (формула в evidence); не установленная правдивость"},
-            "coverage":cov,"scoring_method":SCORING_METHOD,"version":"1.0"}
+    out={"big_five":bf,"mbti":mbti,"enneagram":enn,"temperament":temp,"hexaco":hexa,"pid5":pid5,"auto_evidence":ae,
+         "truthfulness":{"score":s.get("truth_heuristic",50),
+                         "verdict":"невербальный приор нагрузки/утечки (формула в evidence); НЕ вероятность лжи"},
+         "coverage":cov,"scoring_method":SCORING_METHOD,"version":"1.1"}
+    # Единый источник Big Five: если посчитан психометрический слой движка (LR-агрегация,
+    # 95% ДИ, кадры-доказательства) — он и есть основные шкалы OCEAN. Запасной z-композит
+    # остаётся только при его отсутствии; две расходящиеся шкалы в UI больше не показываются.
+    det=primary_big_five(s)
+    if det is not None:
+        out["big_five"]={**det,"notes":det["notes"]}
+        out["_engine"]="psychometrics-LR"
+        out["ci95"]=det.get("ci95"); out["n_indicators"]=det.get("n_indicators")
+        # производные системы пересчитываем по единым осям, чтобы MBTI/PID-5 не противоречили OCEAN
+        E,N,A,C,O=det["extraversion"],det["neuroticism"],det["agreeableness"],det["conscientiousness"],det["openness"]
+        axes=out["mbti"]["axes"]; axes.update({"E_I":E,"S_N":O,"T_F":A,"J_P":C})
+        out["mbti"]["type"]=("E" if E>50 else "I")+("N" if O>50 else "S")+("F" if A>50 else "T")+("J" if C>50 else "P")
+        out["mbti"]["notes"]="оси = единый детерминированный профиль Big Five (psychometrics-LR)"
+        out["hexaco"].update({"E":N,"X":E,"A":A,"C":C,"O":O})
+        out["pid5"].update({"negative_affect":N,"detachment":_clip(100-E),"antagonism":_clip(100-A),"disinhibition":_clip(100-C)})
+        out["enneagram"]["score"]=_clip(55+abs(E-50)/2+abs(N-50)/2)
+    return out
 
 SYS_PATTERNS={"big_five":["P10","P11","P04","P03","P12"],"mbti":["P03","P10","P07","P09"],
  "enneagram":["P02","P11"],"temperament":["P04","P09","P11","P10"],"hexaco":["P10","P12","P06"],

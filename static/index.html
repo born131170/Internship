@@ -117,7 +117,8 @@ pre.out{background:#0d1220;border:1px solid #223;border-radius:10px;padding:12px
   <div class="card row"><select id="snapSel"></select><input id="topk" type="number" value="100" style="width:70px">
     <button class="btn" id="btnSearch">Найти</button>
     <label class="btn sec" style="cursor:pointer">📄 Слепок с диска<input type="file" id="diskSnap" accept=".json" hidden></label>
-    <label class="btn sec" style="cursor:pointer">🎬 Другое видео<input type="file" id="extVideo" accept="video/*" hidden></label></div>
+    <label class="btn sec" style="cursor:pointer">🎬 Другое видео<input type="file" id="extVideo" accept="video/*" hidden></label>
+    <label style="margin-left:8px"><input type="checkbox" id="ftChk"> 🔒 Строгий режим «касание лица» (P06-гейт + морфология кривой)</label></div>
   <div class="card" id="extCard" hidden><h2>Стороннее видео</h2><video id="searchVideo" controls></video><div class="lbl" id="extState"></div></div>
   <div class="card"><div class="lbl" id="resInfo"></div><div id="resList" class="grid" style="margin-top:8px"></div></div></section>
 <section id="p-llm" hidden><h1>Настройки LLM (API)</h1>
@@ -226,10 +227,12 @@ const errText=e=>{try{return JSON.parse(e.message).error||e.message}catch(_){ret
 const SPIN='<span class="spin"></span>';
 const PNAMES={P01:"Моргание",P02:"Кивок при слушании",P03:"Движения головы",P04:"Жестовый эпизод",
  P05:"Амплитуда/скорость жестов",P06:"Рука около лица",P07:"Повторные мелкие движения",P08:"Положение рук",
- P09:"Смена позы",P10:"Подъём уголков губ",P11:"Брови / напряжение губ",P12:"Направление взгляда"};
+ P09:"Смена позы",P10:"Подъём уголков губ",P10D:"Duchenne-улыбка (искренняя)",P11:"Брови / напряжение губ",P12:"Направление взгляда",
+ P13:"Вокализация (речь)",P14:"Пауза в речи ≥0.5 c"};
 let VID=null,SUM=null,MET=null,RESULT=null,POLL=null,PATS=null,EPSC=null,EPS=null,SEARCH_VID=null;
 const EQ=[["P01",0.6,">"],["P02",0.08,">"],["P03",0.03,">"],["P04",0.03,">"],["P05",0.1,">"],["P06",1.0,"<"],
-["P07",0.01,">"],["P08",0.8,"<"],["P09",0.02,">"],["P10",0.4,">"],["P11",0.3,">"],["P12",0.2,">"]];
+["P07",0.01,">"],["P08",0.8,"<"],["P09",0.02,">"],["P10",0.4,">"],["P10D",1.0,">"],["P11",0.3,">"],["P12",0.2,">"],
+["P13",1.0,">"],["P14",0.5,">"]];
 let MULT={}; try{MULT=JSON.parse(localStorage.ps_mult||"{}")}catch(e){MULT={}}
 const CH_LIST=["smile","blink","jawO","browUp","browDown","eyeWide","yc","pc","hand_speed","aperture","hfd","hfd2","tif","menergy","rms","f0","srate"];
 const fmt=t=>{t=Math.max(0,t|0);return String(t/60|0).padStart(2,"0")+":"+String(t%60).padStart(2,"0")};
@@ -273,6 +276,8 @@ async function loadDash(){SUM=await api(`/api/videos/${VID}/summary`); MET=await
   RESULT=await api(`/api/videos/${VID}/llm/result`); try{ window.SCORES=await api(`/api/videos/${VID}/scores`); }catch(_){ window.SCORES=null; } renderAnalysis(); refreshSnaps();}
 function eqLabel(p,mu){ const d=EQ.find(x=>x[0]===p);
   if(p==="P06") return `box×1.30 / 3D<${(0.8*mu).toFixed(2)}`;
+  if(p==="P10D") return mu<=1?"smile>.35 cheek>.15":`cheek>${(0.15*mu).toFixed(2)}`;
+  if(p==="P13") return mu<=1?"речь активна (VAD)":`rms>${(0.005*mu).toFixed(3)}`;
   return d[2]+(d[1]*mu).toFixed(2); }
 function renderEq(){ $("#eqRows").innerHTML=EQ.map(([p,b,s])=>`<div class="ind"><span style="width:32px">${p}</span>
    <input type="range" min="0.25" max="3" step="0.05" value="${MULT[p]||1}" data-p="${p}">
@@ -282,10 +287,16 @@ function renderEq(){ $("#eqRows").innerHTML=EQ.map(([p,b,s])=>`<div class="ind">
 $("#eqReset").onclick=()=>{ MULT={}; localStorage.ps_mult="{}"; renderEq(); buildPATS(); };
 function patAt(r){ const n=v=>v==null?NaN:v; const m=k=>MULT[k]||1;
   const b=n(r.blink),pc=n(r.pc),yc=n(r.yc),hs=n(r.hand_speed),hfd=n(r.hfd),tf=n(r.tif),hands=n(r.hands),ap=n(r.aperture),me=n(r.menergy),sm=n(r.smile),bd=n(r.browDown),pr=n(r.press);
+  const ck=n(r.cheek),rms=n(r.rms),pz=n(r.pause),sp=r.speech;
+  // пороги P06/P10D/P11/P12/P14 масштабируются ползунком эквалайзера (как в конвейере pipeline.PATTERN_DEFS)
   return {t:r.t,P01:b>0.6*m("P01"),P02:Math.abs(pc)>0.08*m("P02"),P03:(Math.abs(yc)+Math.abs(pc))>0.03*m("P03"),
-   P04:hs>0.03*m("P04"),P05:hs>0.1*m("P05"),P06:((tf>0.5||hfd<0.8*m("P06"))&&hands>0),P07:hs>0.01*m("P07"),
-   P08:ap<0.8*m("P08"),P09:me>0.02*m("P09"),P10:sm>0.4*m("P10"),P11:(bd>0.3*m("P11")||pr>0.2*m("P11")),
-   P12:(Math.abs(yc)>0.2*m("P12")||pc>0.2*m("P12"))}; }
+   P04:hs>0.03*m("P04"),P05:hs>0.1*m("P05"),P06:((tf>0.5||hfd<(0.8/m("P06")))&&hands>0),P07:hs>0.01*m("P07"),
+   P08:ap<(0.8/m("P08")),P09:me>0.02*m("P09"),P10:sm>0.4*m("P10"),
+   P10D:sm>0.35&&ck>(0.15*m("P10D")),
+   P11:(bd>0.3*m("P11")||pr>0.2*m("P11")),
+   P12:(Math.abs(yc)>(0.6108*m("P12"))||Math.abs(pc)>(0.6108*m("P12"))),
+   P13:(sp===1||sp===true)||(!isNaN(rms)&&rms>0.005*m("P13")),
+   P14:pz>=0.5*m("P14")}; }
 function buildPATS(){ if(!MET||!SUM) return; PATS=MET.map(patAt);
   const dt=MET.length>1?(MET[MET.length-1].t-MET[0].t)/(MET.length-1):0.08;
   const GAP=Math.max(1,Math.round(0.4/dt)), MIN=Math.max(2,Math.round(0.6/dt));
@@ -303,10 +314,12 @@ function syncLeds(){ if(!PATS||!PATS.length) return; const dv=$("#dashVideo"); c
   for(const k in r){ if(k==="t") continue; const el=$("#led_"+k); if(el) el.classList.toggle("on",!!r[k]);
     const ce=$("#ct_"+k); if(ce&&EPSC&&EPSC[k]) ce.textContent=EPSC[k][i+1]; } }
 setInterval(()=>{ if(!$("#dashCard").hidden) syncLeds(); },250);
+const CUE_NAMES={blink_per_min:"Морганий в минуту (норма 15–25, Bentivoglio 1994)",smile_ratio:"Доля кадров с улыбкой (AU12, FACS)",tension_ratio:"Доля кадров напряжения мимики (AU4/AU23, P11)",avoidance_ratio:"Доля кадров отведения взгляда >35° (P12, Kleinke 1986)",hand_face_ratio:"Доля кадров касания лица рукой (adaptors, P06, Kaitz 2007)",hand_activity_ratio:"Доля кадровой мелкой моторной активности рук (P07)",head_yaw_std:"Стандартное отклонение поворота головы (рад)",head_pitch_std:"Стандартное отклонение наклона головы (рад)",speech_ratio:"Доля времени с речью",pause_per_min:"Пауз ≥0.5 c в минуту речи",speech_rate_syll_per_sec:"Темп речи, слогов/с (норма 3.5–5)",voice_f0_std_hz:"Вариабельность основного тона, Гц"};
 function renderTruth(tr){ const g=$("#gauge"), cl=$("#cueList");
   if(tr){ g.style.setProperty("--v",tr.heuristic); g.textContent=tr.heuristic;
-    cl.innerHTML=`<div class="lbl">Эвристика MediaPipe (без LLM): ${tr.heuristic}/100</div><ul>`+
-    Object.entries(tr.cues).map(([k,v])=>`<li><b>${k}</b>: ${v}</li>`).join("")+"</ul>"; }
+    const entries=Object.entries(tr.cues||{}).map(([k,v])=>`<li><b>${CUE_NAMES[k]||k}</b>: ${typeof v==="number"?+v.toFixed(3):String(v)}</li>`).join("");
+    const psy=tr.psych?`<div class="lbl" style="margin-top:6px">Индекс нагрузки по валидированным маркерам движка: <b>${Math.round(tr.psych.score)}/100</b>${tr.psych.n_indicators!=null?" · индикаторов: "+tr.psych.n_indicators:""}${tr.psych.note?" · "+tr.psych.note:""}</div>`:"";
+    cl.innerHTML=`<div class="lbl">Эвристика MediaPipe (без LLM): ${tr.heuristic}/100 — приор маркеров нагрузки/утечки, НЕ вероятность лжи (Vrij & Stockwell 2023)</div><ul>${entries||"<span class='lbl'>нет cue-метрики</span>"}</ul>${psy}`; }
   else { g.style.setProperty("--v",0); g.textContent="–";
     cl.innerHTML=`<span class="lbl">нет данных — загрузите видео или нажмите «Открыть последний анализ» (сессия сброшена перезагрузкой страницы)</span>`; }
   const t=RESULT&&RESULT.parsed&&RESULT.parsed.truthfulness;
@@ -333,9 +346,38 @@ function psychEvHtml(trait){
     ev.map(e=>{const ep=epById(e.episode_id);
       return `<div class="ep">${ep?`<img src="/api/videos/${VID}/file?path=${ep.thumb}">`:""}<div class="b"><span class="tc">${e.t0.toFixed(1)}–${e.t1.toFixed(1)}с</span> · ${PNAMES[e.pattern]||e.pattern} · <b>${e.direction}</b> (${e.var}=${typeof e.value==="number"?e.value.toFixed(3):e.value}, LR=${e.lr})<br><span class="lbl">${e.note||""}</span></div></div>`;}).join("")+"</div>";
 }
+function detConclusion(sc,pers){
+  // Развёрнутое научное заключение из детерминированных данных движка (без LLM).
+  const TRU={openness:"Открытость опыту",conscientiousness:"Добросовестность",extraversion:"Экстраверсия",agreeableness:"Доброжелательность",neuroticism:"Нейротизм"};
+  const eng=(sc&&sc._engine)==="psychometrics-LR";
+  const band=v=>v>=65?"высокий":v>=55?"выше среднего":v>=45?"средний":v>=35?"ниже среднего":"низкий";
+  const au=(SUM&&SUM.audio)||{}; const cues=(SUM&&SUM.truth_cues)||{}; const c=(SUM&&SUM.counters)||{};
+  const nf=Math.max(1,SUM?SUM.n_frames:1), fr=p=>((c[p]||0)/nf*100).toFixed(0);
+  const parts=[];
+  if(sc){
+    const sorted=["extraversion","agreeableness","conscientiousness","neuroticism","openness"]
+      .map(k=>[k,sc[k]]).filter(x=>typeof x[1]==="number").sort((a,b)=>b[1]-a[1]);
+    const top=sorted.slice(0,2).map(x=>`${TRU[x[0]]} (${Math.round(x[1])}/100, ${band(x[1])})`).join("; ");
+    const low=sorted.slice(-1)[0];
+    let s1=`Профиль Big Five построен ${eng?"детерминированной LR-агрегацией по валидированным невербальным индикаторам (Borkenau & Ziegler 2010; Naumann et al. 2009; Hall & Carter et al. 2016) с 95% доверительными интервалами — без участия LLM":"z-композитом по поведенческим метрикам (формулы открыты в глоссарии)"}. Наиболее выражены: ${top||"—"}; наименее — ${low?TRU[low[0]]+" ("+Math.round(low[1])+"/100)":"—"}.`;
+    if(eng&&sc.ci95){const wide=["extraversion","agreeableness","conscientiousness","neuroticism","openness"].filter(k=>{const ci=sc.ci95[k];return ci&&(ci[1]-ci[0])>40;});
+      if(wide.length) s1+=` Широкие ДИ у ${wide.map(k=>TRU[k]).join(", ")} означают малое число наблюдений — оценка ориентировочная.`;}
+    parts.push(s1);
+  }
+  const beh=[["P04","иллюстративные жесты"],["P07","мелкая моторная активность (fidgeting)"],["P02","кивки"],["P09","смены позы"],["P10","улыбка"],["P10D","улыбка Дюшенна"],["P11","напряжение мимики"],["P12","отведение взгляда >35°"],["P06","касания лица (adaptors)"]].filter(p=>c[p[0]]>0).map(p=>`${p[1]} ${fr(p[0])}% кадров`);
+  if(beh.length) parts.push(`Поведенческая канва видео: ${beh.join("; ")}.`);
+  const a=[]; if(au.speech_ratio!=null) a.push(`доля речи ${(au.speech_ratio*100).toFixed(0)}%`);
+  if(au.speech_rate_syll_per_sec) a.push(`темп речи ${au.speech_rate_syll_per_sec.toFixed(1)} сл./с (норма 3.5–5, Ramon-Sera 2022)`);
+  if(au.pause_intervals_ge05s) a.push(`пауз ≥0.5 c: ${au.pause_intervals_ge05s} (когнитивная нагрузка, Vrij 2017)`);
+  if(cues.blink_per_min) a.push(`моргание ${cues.blink_per_min.toFixed(0)}/мин (норма 15–25, Bentivoglio 1994)`);
+  if(a.length) parts.push(`Вокально-ритмический профиль: ${a.join("; ")}.`);
+  if(sc&&typeof sc.truthfulness?.score==="number") parts.push(`Индекс когнитивной нагрузки/утечки ${sc.truthfulness.score}/100 — это операциональный приор маркеров (напряжение, избегание пауз), а НЕ вероятность лжи: мета-анализы Vrij & Stockwell (2023) показывают, что одиночные невербальные признаки невалидны как детекторы лжи (d<0.2).`);
+  parts.push("Ограничения: выводы описательно-поведенческие, уровень доказательства — корреляционный (r≈0.1–0.3 для невербальных маркеров черт, Vazire 2010); это не клиническая диагностика и не установление типа личности; для психометрически значимого результата требуется валидированный опросник (NEO-PI-R/IPJID-R) и несколько записей в разных контекстах.");
+  return parts.join(" ");
+}
 function renderAnalysis(){const p=RESULT&&RESULT.parsed; const sc=(RESULT&&RESULT.scores)||window.SCORES||null;
   const w=(RESULT&&RESULT.warnings)||[];
-  const top=(sc||p)?`<div class="syscard"><h3>Заключение</h3>${p&&p.summary?p.summary:(sc?`Детерминированный поведенческий скоринг по метрикам MediaPipe (вкладка «Оценка типа личности»): Big Five — регрессионная модель на валидированных невербальных индикаторах с 95% ДИ, MBTI/Эннеаграмма/PID-5 — статус валидности в глоссарии. Точные числовые оценки — на карточках систем ниже; формулы открыты (глоссарий, экспорт .json). Для нарративной интерпретации запустите LLM-анализ на вкладке «Промпт».`:"")} <span class="tag">${sc?"детерминированный скоринг":"—"}</span>${p?` <span class="tag" title="Доля корректно заполненных полей ответа модели (0..1), а не уверенность модели">полнота ответа LLM: ${(p.confidence??0).toFixed(2)}</span>`:""}${p&&p.disclaimer?`<div class="lbl" style="margin-top:6px">${p.disclaimer}</div>`:""}</div>`:"";
+  const top=(sc||p)?`<div class="syscard"><h3>Заключение</h3>${p&&p.summary?p.summary:(sc?detConclusion(sc):"")} <span class="tag">${sc?(p?"LLM-нарратив + детерминированный скоринг":"детерминированный скоринг"):"—"}</span>${p?` <span class="tag" title="Доля корректно заполненных полей ответа модели (0..1), а не уверенность модели">полнота ответа LLM: ${(p.confidence??0).toFixed(2)}</span>`:""}${p&&p.disclaimer?`<div class="lbl" style="margin-top:6px">${p.disclaimer}</div>`:""}</div>`:"";
   $("#sysCards").innerHTML=(w.length?`<div class="warn">Предупреждения валидации:<ul>${w.map(x=>`<li>${x}</li>`).join("")}</ul></div>`:"")+top+
   SYS.map(([k,t,bars,head])=>{
     const d=sc?sc[k]:null; const dn=p?p[k]:null;
@@ -349,7 +391,10 @@ function renderAnalysis(){const p=RESULT&&RESULT.parsed; const sc=(RESULT&&RESUL
       : `<span class="lbl">${p?"модель не указала доказательства":"доказательства появятся после LLM-анализа"}</span>`;
     const psychDet = k==="big_five" ? (SUM&&SUM.personality&&SUM.personality.big_five&&SUM.personality.big_five._detail)||null : null;
     const TRU={extraversion:"Экстраверсия",agreeableness:"Доброжелательность",conscientiousness:"Добросовестность",neuroticism:"Нейротизм",openness:"Открытость"};
-    const psychBars = psychDet ? Object.entries(psychDet).filter(([tt,v])=>v&&typeof v.score==="number")
+    // Дублирующая шкала показывается только если основной профиль ещё НЕ взят из движка
+    // (иначе это те же самые числа — две одинаковые шкалы вводили в заблуждение).
+    const primaryIsEngine = sc && sc._engine==="psychometrics-LR";
+    const psychBars = (psychDet && !primaryIsEngine) ? Object.entries(psychDet).filter(([tt,v])=>v&&typeof v.score==="number")
         .map(([tt,v])=>`<div class="sb"><span>${TRU[tt]||tt} <i class="lbl">(локально, CI ${v.ci95?v.ci95[0]+"–"+v.ci95[1]:"—"})</i></span><span class="t"><i style="width:${v.score}%"></i></span><b>${Math.round(v.score)}</b></div>`).join("") : "";
     const psychEvs = psychDet ? ["extraversion","agreeableness","conscientiousness","neuroticism","openness"].map(tt=>psychEvHtml(tt)).join("") : "";
     return `<div class="syscard"><h3>${t} ${d?(head?`<span class="tag">${head(d)}</span>`:`<span class="tag">данные получены</span>`):`<span class="tag" style="opacity:.5">ждём данных</span>`}${d&&d._reliable===false?'<span class="tag">ненадёжно</span>':""}</h3>${rows}${dn&&dn.notes?`<div class="lbl" style="margin:6px 0">${dn.notes}</div>`:""}${k==="big_five"&&psychBars?`<div class="lbl" style="margin-top:8px"><b>Локальный движок MediaPipe — детерминированная LR-агрегация (без LLM):</b></div>${psychBars}`:""}<div class="grid" style="margin-top:8px">${evHtml}</div>${psychEvs}</div>`;
@@ -450,13 +495,14 @@ $("#extVideo").onchange=async e=>{ const f=e.target.files[0]; if(!f) return;
 $("#btnSearch").onclick=async()=>{ let target=SEARCH_VID||VID;
   if(!target){ try{ if(!await loadLatest()) return alert("Нет завершённых анализов на диске"); }catch(e){ return alert(errText(e)); } target=SEARCH_VID||VID; }
   const sid=$("#snapSel").value; if(!sid) return alert("Выберите слепок или загрузите с диска");
-  try{ const body= sid==="__disk__" ? {snapshot:window.DISK_SNAP,top_k:+$("#topk").value,pattern:null} : {snapshot_id:sid,top_k:+$("#topk").value,pattern:null};
+  const ft=$("#ftChk").checked;
+  try{ const body= sid==="__disk__" ? {snapshot:window.DISK_SNAP,top_k:+$("#topk").value,pattern:null,face_touch:ft} : {snapshot_id:sid,top_k:+$("#topk").value,pattern:null,face_touch:ft};
    const r=await api(`/api/videos/${target}/search`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-   $("#resList").innerHTML=(r.results||[]).map((x,i)=>`<div class="ep"><div class="b">#${i+1} <span class="tc">${fmt(x.t0)}–${fmt(x.t1)}</span><br>${x.pattern?`<span class="tag">${x.pattern}</span>`:""}distance: <b>${x.distance}</b><br>
+   $("#resList").innerHTML=(r.results||[]).map((x,i)=>`<div class="ep"><div class="b">#${i+1} <span class="tc">${fmt(x.t0)}–${fmt(x.t1)}</span><br>${x.pattern?`<span class="tag">${x.pattern}</span>`:""}distance: <b>${x.distance}</b>${x.face_touch_frac!=null?`<br><span class="tag">touch ${(x.face_touch_frac*100).toFixed(0)}%</span>`:""}<br>
     <button class="btn sec" onclick="jumpT(${x.t0})">▶ показать</button></div></div>`).join("")||"<span class='lbl'>ничего не найдено</span>";
    const m=r.meta||{};
    const modeNote=m.mode==="free"?" (скользящее окно: эпизоды паттерна не сегментировались)":(m.total===0?" — эпизодов паттерна в этом видео нет":"");
-   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+modeNote; }
+   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+modeNote+(ft?" Строгий режим касания лица включён.":""); }
   catch(e){ alert("Ошибка поиска: "+errText(e)); } };
 window.jumpT=t=>{ const sv=$("#searchVideo");
   if(SEARCH_VID && !$("#extCard").hidden){ sv.currentTime=t; sv.play(); }

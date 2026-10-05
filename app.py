@@ -120,7 +120,15 @@ def metrics(vid: str): return _clean(_metrics(_vdir(vid)))
 @app.get("/api/videos/{vid}/truth")
 def truth(vid: str):
     s=json.loads((_vdir(vid)/"summary.json").read_text(encoding="utf-8"))
-    return {"cues":_clean(s["truth_cues"]),"heuristic":s["truth_heuristic"]}
+    # единый источник истины: если посчитан психометрический слой движка (load_index по
+    # валидированным маркерам нагрузки/арузала с указанием источников) — показываем его,
+    # а не старую ad-hoc эвристику pipeline (она давала "вечно 50" на тихих видео).
+    dp=((s.get("personality") or {}).get("truthfulness")) if isinstance(s.get("personality"),dict) else None
+    out={"cues":_clean(s["truth_cues"]),"heuristic":s["truth_heuristic"]}
+    if isinstance(dp,dict) and isinstance(dp.get("score"),(int,float)):
+        out["heuristic"]=round(dp["score"])
+        out["psych"]=_clean(dp)
+    return out
 
 @app.get("/api/videos/{vid}/file")
 def vfile(vid: str, path: str):
@@ -174,9 +182,23 @@ def del_snap(sid: str):
 
 @app.post("/api/snapshots/upload")
 async def upload_snap(file: UploadFile=File(...)):
-    data=json.loads(await file.read()); data.setdefault("id",uuid.uuid4().hex[:10])
+    # Валидация вместо 500 на битом JSON (исправление «кнопка не работает»)
+    try:
+        raw=(await file.read()).decode("utf-8-sig",errors="replace")
+        data=json.loads(raw)
+    except Exception as e:
+        return JSONResponse(status_code=422,content={"error":f"файл не является корректным JSON-слепком: {e}"})
+    if not isinstance(data,dict):
+        return JSONResponse(status_code=422,content={"error":"JSON должен быть объектом слепка"})
+    if not (isinstance(data.get("series"),dict) and data["series"]):
+        return JSONResponse(status_code=422,content={"error":"в слепке нет канала series — это не цифровой слепок"})
+    bad=[c for c,v in data["series"].items() if not isinstance(v,list)]
+    if bad:
+        return JSONResponse(status_code=422,content={"error":f"каналы не-списки: {bad}"})
+    data.setdefault("id",uuid.uuid4().hex[:10]); data["id"]=str(data["id"])[:40]
+    data["name"]=str(data.get("name","слепок"))[:80]
     (SNAP/f"{data['id']}.json").write_text(json.dumps(data,ensure_ascii=False),encoding="utf-8")
-    return {"id":data["id"]}
+    return {"id":data["id"],"name":data["name"],"channels":list(data["series"].keys())}
 
 @app.post("/api/videos/{vid}/search")
 def search(vid: str, payload: dict):
@@ -188,7 +210,8 @@ def search(vid: str, payload: dict):
         mode=payload.get("mode") or None   # None -> автовыбор в snapshots.search
         res,meta=snapshots.search(recs,snap,hop=float(payload.get("hop",0.25)),
                                   top_k=int(payload.get("top_k",100)),mode=mode,
-                                  pattern=payload.get("pattern"))
+                                  pattern=payload.get("pattern"),
+                                  face_touch=bool(payload.get("face_touch")))
         return {"snapshot":snap["id"],"results":res,"total":len(res),"meta":meta}
     except Exception as e:
         traceback.print_exc()
