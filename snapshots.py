@@ -206,14 +206,23 @@ def _morph_ok(win,S_c,dur_s,fps_proc):
 
 def _face_touch_gate(r):
     """Строгий кадр касания рукой лица (Kaitz 2007; Vismara 2016; Ekman FACS AU для рук).
-    Требует РЕАЛЬНО детектированную кисть и близость запястья/кончиков пальцев к лицу."""
-    hands=r.get("hands") or 0
+    Требует РЕАЛЬНО детектированную кисть И подтверждение близости к лицу НЕ МЕНЕЕ ДВУХ
+    независимых каналов одновременно: раньше достаточно было одного (например, ложного
+    tif=1 при проецировании запястья в бокс лица поверх одежды — «руки нет, а тач есть»).
+    Теперь: hands>0 + face_conf>=0.3 + минимум два из {tif, hfd<0.8, hfd2<0.55}."""
+    try:
+        hands=float(r.get("hands") or 0)
+    except Exception:
+        return False
     if hands<=0: return False
+    fc=r.get("face_conf")
+    if fc is not None and not _isnan(float(fc)) and float(fc)<0.3: return False
     hfd=r.get("hfd"); hfd2=r.get("hfd2"); tif=r.get("tif")
-    touch=(tif is not None and float(tif)>0.5) or \
-          (hfd is not None and not _isnan(float(hfd)) and float(hfd)<0.8) or \
-          (hfd2 is not None and not _isnan(float(hfd2)) and float(hfd2)<0.55)
-    return bool(touch)
+    signals=0
+    if tif is not None and not _isnan(float(tif)) and float(tif)>0.5: signals+=1
+    if hfd is not None and not _isnan(float(hfd)) and float(hfd)<0.8: signals+=1
+    if hfd2 is not None and not _isnan(float(hfd2)) and float(hfd2)<0.55: signals+=1
+    return signals>=2
 
 def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**kwargs):
     if not records: return [],{"total":0,"version":SNAP_VERSION}
@@ -236,6 +245,26 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
     if len(active)>6 or not active:
         # "веер" v4 или пустая маска: пересчитываем по текущим определениям
         active=_dominant_patterns(winmask)
+    # АВТОРЕЖИМ «касание лица» (исправление «находит эпизоды без рук/лица»):
+    # если в ОКНЕ САМОГО СЛЕПКА доля кадров с реальным touch-gate >= 30%, слепок
+    # семантически является жестом рука->лицо, и строгий P06-гейт включается
+    # автоматически — даже когда пользователь НЕ отметил чекбокс строгого режима.
+    try:
+        wlen=max(1,(br-ra+1)) if ra is not None and br is not None else max(1,len(winmask))
+        wwin=records[ra:br+1] if ra is not None and br is not None else records
+        frac_touch=sum(1 for r in wwin if _face_touch_gate(r))/wlen
+    except Exception:
+        frac_touch=0.0
+    snap_is_touch=frac_touch>=0.30
+    if snap_is_touch and not face_touch:
+        face_touch=True
+        meta_note="авто: окно слепка содержит >=30% кадров касания лица рукой"
+    else:
+        meta_note=""
+    if snap_is_touch and not strict_ft:
+        # для корректной семантики жеста рука->лицо P06 обязателен и в слепке,
+        # иначе целевые окна без лица проходят по одному лишь морфологическому сходству кривой hfd
+        strict_ft=True
     if pattern:
         sel=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]==pattern]
         if sel: active=sel
@@ -255,12 +284,13 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         present=[x for x in active if len(_episodes_of_pattern(mask,x,fps_proc))>0]
         if present:
             # face_touch: касание лица (P06) имеет наивысший приоритет семантики запроса
-            if face_touch:
-                ft=[x for x in present if PAT_DEFS[x][0]=="P06"]
-                if ft: active=ft
-            active=[max(present,key=lambda x:(frac[x],-x))] if not (face_touch and ft) else [ft[0]]
-        else:
+            ft=[x for x in present if PAT_DEFS[x][0]=="P06"]
+            if face_touch and ft: active=[ft[0]]
+            else: active=[max(present,key=lambda x:(frac[x],-x))]
+        elif not strict_ft:
             active=[max(active,key=lambda x:(frac[x],-x))]
+        # strict_ft + нет P06-эпизодов в видео: active остаётся = [P06] -> eps=[],
+        # честный ответ 0 находок (см. ниже), без скатывания в free-скольжение
     b=active[0]; pid=PAT_DEFS[b][0]
     eps=_episodes_of_pattern(mask,b,fps_proc)
     if strict_ft:
@@ -312,7 +342,10 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
     meta={"total":len(cands),"returned":len(keep),"version":SNAP_VERSION,"pattern":pid,
           "mode":mode,"episodes_of_pattern":len(eps),
           "patterns_in_snapshot":[PAT_DEFS[x][0] for x in range(len(PAT_DEFS)) if req&(1<<x)],
-          "channels":chans,"snapshot_duration":dur_s}
+          "channels":chans,"snapshot_duration":dur_s,
+          "face_touch_gate":bool(face_touch),"strict_face_touch":bool(strict_ft),
+          "snapshot_touch_frac":round(float(frac_touch),2)}
+    if meta_note: meta["note"]=meta_note
     return keep,meta
 
 def _segment_bounds(records,t0,t1):

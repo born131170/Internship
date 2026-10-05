@@ -69,7 +69,7 @@ pre.out{background:#0d1220;border:1px solid #223;border-radius:10px;padding:12px
 </aside>
 <main>
 <section id="p-upload">
-  <h1>Научный анализ личности</h1>
+  <h1>Методологический анализ личности</h1>
   <div class="card drop" id="drop">
     <div id="dropHint">Перетащите видеофайл сюда<br><span class="lbl">или выберите через диалог (mp4 / mov / webm)</span></div>
     <div class="row" style="justify-content:center;margin-top:10px">
@@ -112,7 +112,7 @@ pre.out{background:#0d1220;border:1px solid #223;border-radius:10px;padding:12px
   <div class="card"><span class="lbl">Каналы:</span><div id="chans" class="row"></div></div>
   <div class="card"><h2>Сохранённые слепки <span id="snapCount" class="tag"></span></h2>
     <div id="snapList" class="grid" style="max-height:300px;overflow:auto"></div>
-    <div class="row" style="margin-top:10px"><input type="file" id="snapFile" accept=".json"><button class="btn sec" id="btnSnapUp">Загрузить слепок на сервер</button></div></div></section>
+    <div class="row" style="margin-top:10px"><input type="file" id="snapFile" accept=".json,application/json"><button class="btn sec" id="btnSnapUp">Загрузить слепок на сервер</button><span class="lbl" id="upMsg"></span></div></div></section>
 <section id="p-search" hidden><h1>Поиск идентичных эпизодов</h1><div class="sub">Сегментация эпизодов → целевой паттерн (редчайший активный в слепке) → z-norm → 0.3·Euclid + 0.7·DTW + штраф длительности → ранжирование. Искать можно в текущем или в стороннем видео.</div>
   <div class="card row"><select id="snapSel"></select><input id="topk" type="number" value="100" style="width:70px">
     <button class="btn" id="btnSearch">Найти</button>
@@ -455,9 +455,17 @@ $("#btnSnap").onclick=async()=>{ if(!VID){ try{ if(!await loadLatest()) return a
     body:JSON.stringify({t0:+$("#t0").value,t1:+$("#t1").value,name:$("#sname").value||"слепок",channels:chans})});
     refreshSnaps(); alert("Слепок создан: "+s.name+" ("+s.duration+"s, id "+s.id+")"); }
   catch(e){ alert("Ошибка слепка: "+errText(e)); } };
-$("#btnSnapUp").onclick=async()=>{const f=$("#snapFile").files[0]; if(!f)return;
-  const fd=new FormData(); fd.append("file",f);
-  try{ await api("/api/snapshots/upload",{method:"POST",body:fd}); refreshSnaps(); }catch(e){ alert(errText(e)); } };
+$("#btnSnapUp").onclick=async()=>{const inp=$("#snapFile"); const f=inp.files&&inp.files[0];
+  if(!f){ alert("Файл не выбран: сначала выберите .json слепка в поле рядом с кнопкой"); return; }
+  if(!/\.json$/i.test(f.name)){ alert("Нужен файл слепка с расширением .json (выбрано: "+f.name+")"); return; }
+  $("#upMsg").textContent="загрузка "+f.name+" ("+f.size+" байт)…";
+  try{
+    const fd=new FormData(); fd.append("file",f,f.name);
+    const r=await api("/api/snapshots/upload",{method:"POST",body:fd});
+    $("#upMsg").textContent="✓ загружен: "+(r&&r.name||"")+" (id "+(r&&r.id||"?")+")";
+    await refreshSnaps().catch(()=>{});
+  }catch(e){ const m=errText(e); $("#upMsg").textContent="✗ "+m; alert("Ошибка загрузки слепка: "+m); }
+  finally{ inp.value=""; } };
 async function dlSnap(id){ try{ const s=await api("/api/snapshots/"+id);
   const blob=new Blob([JSON.stringify(s,null,2)],{type:"application/json"});
   const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=`snap_${s.name}_${s.id}.json`; a.click(); }
@@ -502,7 +510,8 @@ $("#btnSearch").onclick=async()=>{ let target=SEARCH_VID||VID;
     <button class="btn sec" onclick="jumpT(${x.t0})">▶ показать</button></div></div>`).join("")||"<span class='lbl'>ничего не найдено</span>";
    const m=r.meta||{};
    const modeNote=m.mode==="free"?" (скользящее окно: эпизоды паттерна не сегментировались)":(m.total===0?" — эпизодов паттерна в этом видео нет":"");
-   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+modeNote+(ft?" Строгий режим касания лица включён.":""); }
+   const gateNote=m.face_touch_gate?` Строгий гейт касания лица АКТИВЕН${m.strict_face_touch?" + P06-эпизоды":""} (touch в окне слепка: ${Math.round((m.snapshot_touch_frac||0)*100)}%${m.note?"; "+m.note:""}).`:" Гейт касания лица не активен: в окне слепка мало подтверждённых касаний.";
+   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+modeNote+(ft?" Строгий режим касания лица включён.":"")+gateNote; }
   catch(e){ alert("Ошибка поиска: "+errText(e)); } };
 window.jumpT=t=>{ const sv=$("#searchVideo");
   if(SEARCH_VID && !$("#extCard").hidden){ sv.currentTime=t; sv.play(); }
