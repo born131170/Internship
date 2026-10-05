@@ -1,6 +1,6 @@
 """LLM v4.1: детерминированный скоринг копируется из scores_block, отказ невозможен."""
 from __future__ import annotations
-import json, re
+import json, os, re
 from pathlib import Path
 import httpx
 
@@ -53,6 +53,40 @@ def load_config(data_dir: Path):
         except Exception: pass
     return {"base_url":"https://sharelim.net/v1","api_key":"","model":"gpt-6-astra","temperature":0.3}
 
+def compute_confidence(parsed, warnings) -> float:
+    """Честный индикатор полноты LLM-ответа 0..1 (не уверенность модели!)."""
+    if not isinstance(parsed, dict): return 0.0
+    blocks={"big_five":["openness","conscientiousness","extraversion","agreeableness","neuroticism"],
+            "hexaco":["H","E","X","A","C","O"],
+            "pid5":["negative_affect","detachment","antagonism","disinhibition","psychoticism"],
+            "temperament":["sanguine","choleric","melancholic","phlegmatic"]}
+    filled=total=0
+    for blk,keys in blocks.items():
+        d=parsed.get(blk)
+        if isinstance(d,dict):
+            total+=len(keys)
+            filled+=sum(1 for k in keys if isinstance(d.get(k),(int,float)) and not isinstance(d.get(k),bool))
+    mb=parsed.get("mbti")
+    if isinstance(mb,dict):
+        ax=mb.get("axes") or {}
+        ks=["E_I","S_N","T_F","J_P"]; total+=4
+        filled+=sum(1 for k in ks if isinstance(ax.get(k),(int,float)))
+    en=parsed.get("enneagram")
+    if isinstance(en,dict):
+        total+=1; filled+=1 if isinstance(en.get("type"),(int,float)) else 0
+    t=parsed.get("truthfulness")
+    if isinstance(t,dict):
+        total+=1; filled+=1 if isinstance(t.get("score"),(int,float)) else 0
+    ev=parsed.get("evidence") or {}
+    syskeys=["big_five","mbti","enneagram","temperament","hexaco","pid5","truthfulness"]
+    total+=len(syskeys)
+    filled+=sum(1 for k in syskeys if isinstance(ev.get(k),list) and len(ev.get(k))>0)
+    if isinstance(parsed.get("summary"),str) and parsed["summary"].strip():
+        total+=1; filled+=1
+    base=filled/max(1,total)
+    pen=min(0.3, 0.05*len(set(warnings or [])))
+    return round(max(0.0,min(1.0,base-pen)),2)
+
 def save_config(data_dir: Path, cfg: dict):
     (Path(data_dir)/"llm_config.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=1),encoding="utf-8")
 
@@ -82,11 +116,17 @@ def _as_text(c) -> str:
         return "".join(out)
     return json.dumps(c,ensure_ascii=False)
 
-def chat(cfg: dict, messages: list, timeout=90):
+DEFAULT_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "180"))  # настраивается через env или cfg["timeout"]
+
+def chat(cfg: dict, messages: list, timeout=None):
     url=cfg["base_url"].rstrip("/")+"/chat/completions"
     headers={"Authorization":f"Bearer {cfg.get('api_key','')}"}
     payload={"model":cfg.get("model"),"temperature":cfg.get("temperature",0.3),"messages":messages}
-    r=httpx.post(url,json=payload,headers=headers,timeout=timeout)
+    to=float(timeout or cfg.get("timeout") or DEFAULT_TIMEOUT)
+    try:
+        r=httpx.post(url,json=payload,headers=headers,timeout=to)
+    except httpx.TimeoutException as e:
+        raise type(e)(f"Таймаут запроса к API ({int(to)} c)") from e
     r.raise_for_status()
     data=r.json()
     msg=None; fr=""
@@ -200,7 +240,7 @@ def build_evidence(summary: dict, max_episodes=40):
     eps=summary.get("episodes",[])
     counts={}
     for e in eps: counts[e["pattern"]]=counts.get(e["pattern"],0)+1
-    return {"video":{"duration_sec":summary["duration_sec"],"fps":summary["fps"],"frames":summary["n_frames"]},
+    evidence={"video":{"duration_sec":summary["duration_sec"],"fps":summary["fps"],"frames":summary["n_frames"]},
             "pattern_counters":summary["counters"],"pattern_events":summary["events"],
             "pattern_names":summary["pattern_names"],"stats":summary["stats"],
             "emotion_distribution":summary["emotions"],"truth_cues":summary["truth_cues"],
@@ -239,7 +279,21 @@ def _force_format(cite_cap: int) -> str:
         base+=" В evidence всех систем верни пустые списки: только scores, summary, truthfulness."
     return base
 
-def run_analysis(cfg: dict, user_prompt: str, evidence: dict, cite_cap: int=6):
-    msgs=[{"role":"system","content":SYSTEM_PROMPT},
+def run_analysis(cfg: dict, user_prompt: str, evidence: dict, cite_cap: int=6, retries: int=2):
+    """Запрос к LLM с внутренними автоповторами на сетевые ошибки/таймауты.
+    Системный промпт берётся из cfg["system_prompt"], если он задан и не совпадает
+    со значением по умолчанию (тогда используется встроенный SYSTEM_PROMPT)."""
+    import time as _t
+    sysp=(cfg.get("system_prompt") or "").strip() or SYSTEM_PROMPT
+    msgs=[{"role":"system","content":sysp},
           {"role":"user","content":(user_prompt or DEFAULT_USER_PROMPT)+_force_format(cite_cap)+"\n\nEVIDENCE JSON:\n"+json.dumps(evidence,ensure_ascii=False)}]
-    return chat(cfg,msgs)
+    last=None
+    for attempt in range(retries+1):
+        try:
+            return chat(cfg,msgs)
+        except Exception as e:
+            last=e
+            if attempt<retries and is_retriable(e):
+                _t.sleep(1.5*(attempt+1)); continue
+            raise
+    raise last

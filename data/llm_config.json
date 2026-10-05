@@ -1,6 +1,0 @@
-{
- "base_url": "https://sharellm.net/v1",
- "api_key": "sk-7G3mOSllBs7R5CTnSTP8tEjnu9UcPpSF2ge5RpnNd4ShvNi4",
- "model": "gpt-6-astra",
- "temperature": 0.3
-}

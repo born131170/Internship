@@ -16,6 +16,30 @@ def _g(st,ch,key="mean"):
     d=(st or {}).get(ch) or {}
     return d.get(key)
 
+def primary_big_five(s):
+    """Единый источник числовых Big Five для всего приложения (UI, LLM, экспорт).
+    Приоритет: детерминированный психометрический слой движка (LR-агрегация по
+    валидированным индикаторам с 95% ДИ, psychometrics.py) — если он посчитан.
+    Иначе — запасной z-композит scoring v1 (помечается _engine="z-composite")."""
+    ps=s.get("personality") if isinstance(s,dict) else None
+    bf=(ps or {}).get("big_five") if isinstance(ps,dict) else None
+    det=(bf or {}).get("_detail") if isinstance(bf,dict) else None
+    keys=("openness","conscientiousness","extraversion","agreeableness","neuroticism")
+    if isinstance(det,dict):
+        vals={k:(det.get(k) or {}).get("score") for k in keys}
+        got=[k for k in keys if isinstance(vals[k],(int,float))]
+        if len(got)>=3:
+            out=dict(vals)
+            for k in keys:
+                if not isinstance(out[k],(int,float)): out[k]=50.0
+            out["_engine"]="psychometrics-LR"
+            out["ci95"]={k:(det.get(k) or {}).get("ci95") for k in keys}
+            out["n_indicators"]={k:(det.get(k) or {}).get("n_indicators") for k in keys}
+            out["notes"]=("детерминированная LR-агрегация по невербальным индикаторам "
+                          "(Borkenau 2010; Naumann 2009; Hall&Carter 2016 meta); см. глоссарий")
+            return out
+    return None
+
 def compute_scores(s):
     c=s.get("counters",{}); st=s.get("stats",{}); cues=s.get("truth_cues",{}); au=s.get("audio") or {}
     nf=max(1,s.get("n_frames",1))
@@ -90,9 +114,12 @@ def enrich_parsed(parsed, s, min_items=2, max_items=6):
     if not isinstance(parsed,dict): return parsed
     ev=parsed.get("evidence")
     if not isinstance(ev,dict): ev={}; parsed["evidence"]=ev
-    ae=auto_evidence(s,max_items)
+    try:
+        ae=auto_evidence(s,max_items)
+    except Exception:
+        return parsed
     for key,auto in ae.items():
-        cur=[x for x in ev.get(key,[]) if isinstance(x,dict)]
+        cur=[x for x in (ev.get(key) or []) if isinstance(x,dict)]
         have={x.get("episode_id") for x in cur}
         for a in auto:
             if len(cur)>=min_items: break
