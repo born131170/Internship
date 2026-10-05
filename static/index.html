@@ -117,7 +117,8 @@ pre.out{background:#0d1220;border:1px solid #223;border-radius:10px;padding:12px
   <div class="card row"><select id="snapSel"></select><input id="topk" type="number" value="100" style="width:70px">
     <button class="btn" id="btnSearch">Найти</button>
     <label class="btn sec" style="cursor:pointer">📄 Слепок с диска<input type="file" id="diskSnap" accept=".json" hidden></label>
-    <label class="btn sec" style="cursor:pointer">🎬 Другое видео<input type="file" id="extVideo" accept="video/*" hidden></label></div>
+    <label class="btn sec" style="cursor:pointer">🎬 Другое видео<input type="file" id="extVideo" accept="video/*" hidden></label>
+    <label style="margin-left:8px"><input type="checkbox" id="ftChk"> 🔒 Строгий режим «касание лица» (P06-гейт + морфология кривой)</label></div>
   <div class="card" id="extCard" hidden><h2>Стороннее видео</h2><video id="searchVideo" controls></video><div class="lbl" id="extState"></div></div>
   <div class="card"><div class="lbl" id="resInfo"></div><div id="resList" class="grid" style="margin-top:8px"></div></div></section>
 <section id="p-llm" hidden><h1>Настройки LLM (API)</h1>
@@ -313,10 +314,12 @@ function syncLeds(){ if(!PATS||!PATS.length) return; const dv=$("#dashVideo"); c
   for(const k in r){ if(k==="t") continue; const el=$("#led_"+k); if(el) el.classList.toggle("on",!!r[k]);
     const ce=$("#ct_"+k); if(ce&&EPSC&&EPSC[k]) ce.textContent=EPSC[k][i+1]; } }
 setInterval(()=>{ if(!$("#dashCard").hidden) syncLeds(); },250);
+const CUE_NAMES={blink_per_min:"Морганий в минуту (норма 15–25, Bentivoglio 1994)",smile_ratio:"Доля кадров с улыбкой (AU12, FACS)",tension_ratio:"Доля кадров напряжения мимики (AU4/AU23, P11)",avoidance_ratio:"Доля кадров отведения взгляда >35° (P12, Kleinke 1986)",hand_face_ratio:"Доля кадров касания лица рукой (adaptors, P06, Kaitz 2007)",hand_activity_ratio:"Доля кадровой мелкой моторной активности рук (P07)",head_yaw_std:"Стандартное отклонение поворота головы (рад)",head_pitch_std:"Стандартное отклонение наклона головы (рад)",speech_ratio:"Доля времени с речью",pause_per_min:"Пауз ≥0.5 c в минуту речи",speech_rate_syll_per_sec:"Темп речи, слогов/с (норма 3.5–5)",voice_f0_std_hz:"Вариабельность основного тона, Гц"};
 function renderTruth(tr){ const g=$("#gauge"), cl=$("#cueList");
   if(tr){ g.style.setProperty("--v",tr.heuristic); g.textContent=tr.heuristic;
-    cl.innerHTML=`<div class="lbl">Эвристика MediaPipe (без LLM): ${tr.heuristic}/100</div><ul>`+
-    Object.entries(tr.cues).map(([k,v])=>`<li><b>${k}</b>: ${v}</li>`).join("")+"</ul>"; }
+    const entries=Object.entries(tr.cues||{}).map(([k,v])=>`<li><b>${CUE_NAMES[k]||k}</b>: ${typeof v==="number"?+v.toFixed(3):String(v)}</li>`).join("");
+    const psy=tr.psych?`<div class="lbl" style="margin-top:6px">Индекс нагрузки по валидированным маркерам движка: <b>${Math.round(tr.psych.score)}/100</b>${tr.psych.n_indicators!=null?" · индикаторов: "+tr.psych.n_indicators:""}${tr.psych.note?" · "+tr.psych.note:""}</div>`:"";
+    cl.innerHTML=`<div class="lbl">Эвристика MediaPipe (без LLM): ${tr.heuristic}/100 — приор маркеров нагрузки/утечки, НЕ вероятность лжи (Vrij & Stockwell 2023)</div><ul>${entries||"<span class='lbl'>нет cue-метрики</span>"}</ul>${psy}`; }
   else { g.style.setProperty("--v",0); g.textContent="–";
     cl.innerHTML=`<span class="lbl">нет данных — загрузите видео или нажмите «Открыть последний анализ» (сессия сброшена перезагрузкой страницы)</span>`; }
   const t=RESULT&&RESULT.parsed&&RESULT.parsed.truthfulness;
@@ -492,13 +495,14 @@ $("#extVideo").onchange=async e=>{ const f=e.target.files[0]; if(!f) return;
 $("#btnSearch").onclick=async()=>{ let target=SEARCH_VID||VID;
   if(!target){ try{ if(!await loadLatest()) return alert("Нет завершённых анализов на диске"); }catch(e){ return alert(errText(e)); } target=SEARCH_VID||VID; }
   const sid=$("#snapSel").value; if(!sid) return alert("Выберите слепок или загрузите с диска");
-  try{ const body= sid==="__disk__" ? {snapshot:window.DISK_SNAP,top_k:+$("#topk").value,pattern:null} : {snapshot_id:sid,top_k:+$("#topk").value,pattern:null};
+  const ft=$("#ftChk").checked;
+  try{ const body= sid==="__disk__" ? {snapshot:window.DISK_SNAP,top_k:+$("#topk").value,pattern:null,face_touch:ft} : {snapshot_id:sid,top_k:+$("#topk").value,pattern:null,face_touch:ft};
    const r=await api(`/api/videos/${target}/search`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-   $("#resList").innerHTML=(r.results||[]).map((x,i)=>`<div class="ep"><div class="b">#${i+1} <span class="tc">${fmt(x.t0)}–${fmt(x.t1)}</span><br>${x.pattern?`<span class="tag">${x.pattern}</span>`:""}distance: <b>${x.distance}</b><br>
+   $("#resList").innerHTML=(r.results||[]).map((x,i)=>`<div class="ep"><div class="b">#${i+1} <span class="tc">${fmt(x.t0)}–${fmt(x.t1)}</span><br>${x.pattern?`<span class="tag">${x.pattern}</span>`:""}distance: <b>${x.distance}</b>${x.face_touch_frac!=null?`<br><span class="tag">touch ${(x.face_touch_frac*100).toFixed(0)}%</span>`:""}<br>
     <button class="btn sec" onclick="jumpT(${x.t0})">▶ показать</button></div></div>`).join("")||"<span class='lbl'>ничего не найдено</span>";
    const m=r.meta||{};
    const modeNote=m.mode==="free"?" (скользящее окно: эпизоды паттерна не сегментировались)":(m.total===0?" — эпизодов паттерна в этом видео нет":"");
-   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+modeNote; }
+   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+modeNote+(ft?" Строгий режим касания лица включён.":""); }
   catch(e){ alert("Ошибка поиска: "+errText(e)); } };
 window.jumpT=t=>{ const sv=$("#searchVideo");
   if(SEARCH_VID && !$("#extCard").hidden){ sv.currentTime=t; sv.play(); }

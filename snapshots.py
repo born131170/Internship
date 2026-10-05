@@ -192,10 +192,35 @@ def _episodes_of_pattern(mask,b,fps_proc):
     if st is not None: ints.append([st,last])
     return [ints[k] for k in range(len(ints)) if ints[k][1]-ints[k][0]>=MIN]
 
+def _morph_ok(win,S_c,dur_s,fps_proc):
+    """Морфологическая проверка формы кривой окна против слепка (аффинно-инвариантно)."""
+    v=np.asarray([x for x in win if not _isnan(x)],dtype=float)
+    if len(v)<max(3,int(0.4*fps_proc)): return False
+    cs=_znorm(_resample(v))
+    d_euc=float(np.sqrt(np.mean((cs-S_c)**2)))
+    d_dtw=dtw_dist(cs,S_c)
+    # пик внутри окна (жест имеет вершину), а не монотонный дрейф
+    k=int(np.argmax(cs)); edge=max(k,len(cs)-1-k)
+    has_peak=edge>=0.15*(len(cs)-1)
+    return (d_euc<=1.7 and d_dtw<=1.35 and has_peak)
+
+def _face_touch_gate(r):
+    """Строгий кадр касания рукой лица (Kaitz 2007; Vismara 2016; Ekman FACS AU для рук).
+    Требует РЕАЛЬНО детектированную кисть и близость запястья/кончиков пальцев к лицу."""
+    hands=r.get("hands") or 0
+    if hands<=0: return False
+    hfd=r.get("hfd"); hfd2=r.get("hfd2"); tif=r.get("tif")
+    touch=(tif is not None and float(tif)>0.5) or \
+          (hfd is not None and not _isnan(float(hfd)) and float(hfd)<0.8) or \
+          (hfd2 is not None and not _isnan(float(hfd2)) and float(hfd2)<0.55)
+    return bool(touch)
+
 def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**kwargs):
     if not records: return [],{"total":0,"version":SNAP_VERSION}
     chans=[c for c in snap.get("channels",[]) if c in snap.get("series",{})]
     if not chans: return [],{"total":0,"version":SNAP_VERSION}
+    face_touch=bool(kwargs.get("face_touch")) or pattern=="P06"
+    strict_ft = bool(kwargs.get("face_touch"))   # запрос пользователя: искать ТОЛЬКО касания рукой лица
     S={c:np.asarray(snap["series"][c],dtype=float) for c in chans}
     dur_s=float(snap.get("duration",1.0)) or 1.0
     T=[r.get("t",0.0) for r in records]
@@ -214,6 +239,11 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
     if pattern:
         sel=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]==pattern]
         if sel: active=sel
+    if strict_ft:
+        # семантика запроса пользователя: искать ТОЛЬКО касания рукой лица (P06),
+        # независимо от маски слепка (в т.ч. старых v4.0 с "веером")
+        p06=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]=="P06"]
+        if p06: active=p06
     if len(active)>1:
         # Было: выбирался САМЫЙ РЕДКИЙ активный паттерн (cnt[0]) — при "веере" это
         # приводило к P11 с 0 эпизодами и пустому поиску. Теперь приоритет:
@@ -224,12 +254,21 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         frac={x:float(np.mean((winmask>>x)&1==1)) for x in active}
         present=[x for x in active if len(_episodes_of_pattern(mask,x,fps_proc))>0]
         if present:
-            active=[max(present,key=lambda x:(frac[x],-x))]
+            # face_touch: касание лица (P06) имеет наивысший приоритет семантики запроса
+            if face_touch:
+                ft=[x for x in present if PAT_DEFS[x][0]=="P06"]
+                if ft: active=ft
+            active=[max(present,key=lambda x:(frac[x],-x))] if not (face_touch and ft) else [ft[0]]
         else:
             active=[max(active,key=lambda x:(frac[x],-x))]
     b=active[0]; pid=PAT_DEFS[b][0]
     eps=_episodes_of_pattern(mask,b,fps_proc)
-    mode=mode or ("episodes" if eps else "free")
+    if strict_ft:
+        # в строгом режиме не скатываемся в free-скольжение: если P06-эпизодов нет,
+        # честный ответ — 0 находок (а не шумовые окна без рук)
+        mode="episodes"
+    else:
+        mode=mode or ("episodes" if eps else "free")
     cands=[]
     if mode=="free":
         # скользящее окно без привязки к паттерну: работает всегда, даже когда
@@ -244,8 +283,12 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         win=records[a:bb+1]
         dur_c=T[bb]-T[a]
         if dur_c<=0: continue
+        # face_touch: хотя бы в 25% кадров окна реально детектирована кисть у лица
+        if face_touch:
+            ntouch=sum(1 for r in win if _face_touch_gate(r))
+            if ntouch < max(2,int(round(0.25*len(win)))): continue
         pen=0.15*abs(math.log(dur_c/dur_s))
-        d=0.0; ok=0
+        d=0.0; ok=0; morph_fail=False
         for c in chans:
             v=np.array([r.get(c,float("nan")) for r in win],dtype=float)
             if len(v)==0 or np.all(np.isnan(v)): continue
@@ -253,10 +296,17 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
             de=float(np.sqrt(np.mean((cs-S[c])**2)))
             dd=dtw_dist(cs,S[c])
             d+=0.3*de+0.7*dd; ok+=1
+            if not _morph_ok(v,S[c],dur_s,fps_proc): morph_fail=True
         if ok==0: continue
-        cands.append({"t0":round(T[a],2),"t1":round(T[bb],2),"frames":bb-a+1,
-                      "pattern":pid,"ep":k,"dur_ratio":round(dur_c/dur_s,2),
-                      "distance":round(d/ok+pen,4)})
+        if face_touch and morph_fail: continue   # строгий режим: форма кривой обязательна
+        ft_frac=None
+        if face_touch:
+            ft_frac=round(sum(1 for r in win if _face_touch_gate(r))/len(win),2)
+        item={"t0":round(T[a],2),"t1":round(T[bb],2),"frames":bb-a+1,
+              "pattern":pid,"ep":k,"dur_ratio":round(dur_c/dur_s,2),
+              "distance":round(d/ok+pen,4)}
+        if ft_frac is not None: item["face_touch_frac"]=ft_frac
+        cands.append(item)
     cands.sort(key=lambda x:x["distance"])
     keep=cands[:max(1,int(top_k))]
     meta={"total":len(cands),"returned":len(keep),"version":SNAP_VERSION,"pattern":pid,
