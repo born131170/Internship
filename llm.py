@@ -212,6 +212,23 @@ def validate_result(parsed: dict, summary: dict):
         if vals and abs(sum(vals)-100)>5:
             warn.append(f"temperament: сумма процентов {round(sum(vals),1)} != 100 — значения помечены ненадёжными")
             t["_reliable"]=False
+    tt=parsed.get("truthfulness")
+    if isinstance(tt,dict):
+        # жёсткая гарантия: score берётся ТОЛЬКО из детерминированного скоринга движка;
+        # модель не может привнести своё число (раньше "Score: 50/100" приходил прямо из LLM)
+        try:
+            import scoring as _sc
+            det=_sc.compute_scores(summary) if isinstance(summary,dict) else None
+            dt=(det or {}).get("truthfulness") or {}
+            dscore=dt.get("score")
+            if isinstance(dscore,(int,float)):
+                if isinstance(tt.get("score"),(int,float)) and abs(float(tt["score"])-float(dscore))>2:
+                    warn.append(f"truthfulness.score={tt['score']} заменён детерминированным значением движка {dscore} (LLM не меняет числа)")
+                tt["score"]=dscore
+                if not (tt.get("verdict") or "").strip():
+                    tt["verdict"]=dt.get("verdict","")
+        except Exception as e:
+            warn.append(f"truthfulness: детерминированная подстановка не выполнена ({e})")
     fillmap=[("big_five",["openness","conscientiousness","extraversion","agreeableness","neuroticism"]),
              ("hexaco",["H","E","X","A","C","O"]),
              ("pid5",["negative_affect","detachment","antagonism","disinhibition","psychoticism"])]

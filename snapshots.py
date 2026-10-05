@@ -192,6 +192,63 @@ def _episodes_of_pattern(mask,b,fps_proc):
     if st is not None: ints.append([st,last])
     return [ints[k] for k in range(len(ints)) if ints[k][1]-ints[k][0]>=MIN]
 
+def _spans_by_activity(records,mask,chans,fps_proc,dur_s,min_frac=0.15,max_mult=3.0):
+    """Сплайсинг длинного окна на отдельные ЭПИЗОДЫ по локальной активности каналов слепка.
+
+    Исправляет «одно окно 53 с вместо трёх эпизодов по 1–2 с»: раньше в режиме free
+    окно всегда равнялось полной длительности слепка. Теперь внутри скользящего окна
+    ищем сегменты с аномальной активностью (z-score > 1 по |diff| или std канала),
+    склеиваем их с окном ±0.4 с и отдаём как независимые кандидаты. Если выраженных
+    всплесков нет — возвращаем исходное окно целиком (честно, без выдумывания)."""
+    W=max(3,int(round(dur_s*fps_proc)))
+    pad=int(round(0.4*fps_proc))
+    lo_cut=min(1.0,0.35*dur_s); hi_cut=max(2.0,2.0*dur_s)
+    out=[]
+    for start in range(0,max(1,len(records)-W+1)):
+        win=records[start:start+W]
+        mseg=mask[start:start+W]
+        segs=[]
+        for c in chans:
+            v=np.array([r.get(c,float("nan")) for r in win],dtype=float)
+            ok=~np.isnan(v)
+            if ok.sum()<max(3,int(0.3*len(v))): continue
+            vv=v[ok]; idx=np.where(ok)[0]
+            d=np.abs(np.diff(vv)); s=float(np.nanstd(vv))
+            med_d=float(np.median(d)); mad_d=float(np.median(np.abs(d-med_d))) or 1e-9
+            z_thr=med_d+3.0*mad_d
+            act=(d>max(z_thr,s))|(d>2.0*med_d)
+            hits=[int(idx[i]) for i in range(len(act)) if bool(act[i])]
+            cur=None; last_i=-10
+            for h in hits:
+                if cur is None: cur=[h,h]
+                elif h-last_i<=2*pad: cur[1]=h
+                else: segs.append(tuple(cur)); cur=[h,h]
+                last_i=h
+            if cur is not None: segs.append(tuple(cur))
+        merged=[]
+        for a,b in sorted(segs):
+            a2=max(0,a-pad); b2=min(W-1,b+pad)
+            if merged and a2<=merged[-1][1]+1: merged[-1]=(merged[-1][0],max(merged[-1][1],b2))
+            else: merged.append((a2,b2))
+        # фильтр по длительности эпизода: не короче min(lo_cut, 0.3·dur) и не длиннее max(hi_cut, dur)
+        min_len=max(2,int(round(min(lo_cut,0.3*dur_s)*fps_proc)))
+        max_len=max(min_len+1,int(round(max(hi_cut,dur_s)*fps_proc)))
+        frac_ok=int(round(min_frac*W))
+        for a2,b2 in merged:
+            if b2-a2+1<min_len: continue
+            if b2-a2+1>max_len: continue
+            if sum(bool(mseg[i]) for i in range(a2,b2+1))<frac_ok: continue
+            out.append((start+a2,start+b2))
+    # дедупликация перекрывающихся спанов (окна с шагом 1 кадр дают ~дублей)
+    uniq=[]
+    for a,b in sorted(set(out)):
+        if uniq and a<=uniq[-1][1]: continue
+        uniq.append((a,b))
+    if not uniq:
+        for start in range(0,max(1,len(records)-W+1)):
+            uniq.append((start,start+W-1))
+    return uniq[:800]
+
 def _morph_ok(win,S_c,dur_s,fps_proc):
     """Морфологическая проверка формы кривой окна против слепка (аффинно-инвариантно)."""
     v=np.asarray([x for x in win if not _isnan(x)],dtype=float)
@@ -206,14 +263,23 @@ def _morph_ok(win,S_c,dur_s,fps_proc):
 
 def _face_touch_gate(r):
     """Строгий кадр касания рукой лица (Kaitz 2007; Vismara 2016; Ekman FACS AU для рук).
-    Требует РЕАЛЬНО детектированную кисть и близость запястья/кончиков пальцев к лицу."""
-    hands=r.get("hands") or 0
+    Требует РЕАЛЬНО детектированную кисть И подтверждение близости к лицу НЕ МЕНЕЕ ДВУХ
+    независимых каналов одновременно: раньше достаточно было одного (например, ложного
+    tif=1 при проецировании запястья в бокс лица поверх одежды — «руки нет, а тач есть»).
+    Теперь: hands>0 + face_conf>=0.3 + минимум два из {tif, hfd<0.8, hfd2<0.55}."""
+    try:
+        hands=float(r.get("hands") or 0)
+    except Exception:
+        return False
     if hands<=0: return False
+    fc=r.get("face_conf")
+    if fc is not None and not _isnan(float(fc)) and float(fc)<0.3: return False
     hfd=r.get("hfd"); hfd2=r.get("hfd2"); tif=r.get("tif")
-    touch=(tif is not None and float(tif)>0.5) or \
-          (hfd is not None and not _isnan(float(hfd)) and float(hfd)<0.8) or \
-          (hfd2 is not None and not _isnan(float(hfd2)) and float(hfd2)<0.55)
-    return bool(touch)
+    signals=0
+    if tif is not None and not _isnan(float(tif)) and float(tif)>0.5: signals+=1
+    if hfd is not None and not _isnan(float(hfd)) and float(hfd)<0.8: signals+=1
+    if hfd2 is not None and not _isnan(float(hfd2)) and float(hfd2)<0.55: signals+=1
+    return signals>=2
 
 def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**kwargs):
     if not records: return [],{"total":0,"version":SNAP_VERSION}
@@ -236,6 +302,26 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
     if len(active)>6 or not active:
         # "веер" v4 или пустая маска: пересчитываем по текущим определениям
         active=_dominant_patterns(winmask)
+    # АВТОРЕЖИМ «касание лица» (исправление «находит эпизоды без рук/лица»):
+    # если в ОКНЕ САМОГО СЛЕПКА доля кадров с реальным touch-gate >= 30%, слепок
+    # семантически является жестом рука->лицо, и строгий P06-гейт включается
+    # автоматически — даже когда пользователь НЕ отметил чекбокс строгого режима.
+    try:
+        wlen=max(1,(br-ra+1)) if ra is not None and br is not None else max(1,len(winmask))
+        wwin=records[ra:br+1] if ra is not None and br is not None else records
+        frac_touch=sum(1 for r in wwin if _face_touch_gate(r))/wlen
+    except Exception:
+        frac_touch=0.0
+    snap_is_touch=frac_touch>=0.30
+    if snap_is_touch and not face_touch:
+        face_touch=True
+        meta_note="авто: окно слепка содержит >=30% кадров касания лица рукой"
+    else:
+        meta_note=""
+    if snap_is_touch and not strict_ft:
+        # для корректной семантики жеста рука->лицо P06 обязателен и в слепке,
+        # иначе целевые окна без лица проходят по одному лишь морфологическому сходству кривой hfd
+        strict_ft=True
     if pattern:
         sel=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]==pattern]
         if sel: active=sel
@@ -255,13 +341,25 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         present=[x for x in active if len(_episodes_of_pattern(mask,x,fps_proc))>0]
         if present:
             # face_touch: касание лица (P06) имеет наивысший приоритет семантики запроса
-            if face_touch:
-                ft=[x for x in present if PAT_DEFS[x][0]=="P06"]
-                if ft: active=ft
-            active=[max(present,key=lambda x:(frac[x],-x))] if not (face_touch and ft) else [ft[0]]
-        else:
+            ft=[x for x in present if PAT_DEFS[x][0]=="P06"]
+            if face_touch and ft: active=[ft[0]]
+            else: active=[max(present,key=lambda x:(frac[x],-x))]
+        elif not strict_ft:
             active=[max(active,key=lambda x:(frac[x],-x))]
+        # strict_ft + нет P06-эпизодов в видео: active остаётся = [P06] -> eps=[],
+        # честный ответ 0 находок (см. ниже), без скатывания в free-скольжение
     b=active[0]; pid=PAT_DEFS[b][0]
+    # ЯВНЫЙ выбор целевого паттерна пользователем (payload.pattern): пересчёт доли
+    # активности этого паттерна в окне слепка. Без этого длинный слепок (несколько
+    # жестов в одном окне) выбирал шумовой P07 вместо осмысленного P06, и поиск
+    # возвращал произвольные 20-секундные окна вместо реальных эпизодов жеста.
+    if pattern:
+        sel=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]==pattern]
+        if sel:
+            b=sel[0]; pid=PAT_DEFS[b][0]
+            frac={x:float(np.mean((winmask>>x)&1==1)) for x in active}
+            frac[b]=float(np.mean((winmask>>b)&1==1)) if len(winmask) else 1.0
+            active=[b]
     eps=_episodes_of_pattern(mask,b,fps_proc)
     if strict_ft:
         # в строгом режиме не скатываемся в free-скольжение: если P06-эпизодов нет,
@@ -271,12 +369,17 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         mode=mode or ("episodes" if eps else "free")
     cands=[]
     if mode=="free":
-        # скользящее окно без привязки к паттерну: работает всегда, даже когда
-        # пороговый паттерн в целевом видео не сегментируется на эпизоды
+        # скользящее окно + СПЛАЙСИНГ по активности: длинное окно (например слепок
+        # 53 с) режется на отдельные эпизоды-всплески по локальной активности каналов
+        # слепка — иначе пользователь получает «1 находка = всё видео», хотя внутри
+        # окна несколько коротких жестов по 1–2 с
         W=max(3,int(round(dur_s*fps_proc)))
         step=max(1,int(round(float(hop or 0.25)*fps_proc)))
-        starts=list(range(0,max(1,len(records)-W+1),step)) or [0]
-        spans=[(s,min(len(records)-1,s+W-1)) for s in starts]
+        spans=_spans_by_activity(records,mask,chans,fps_proc,dur_s)
+        # если сплайсинг вернул окна целиком (нет всплесков) — оставляем обычную сетку
+        if not spans:
+            starts=list(range(0,max(1,len(records)-W+1),step)) or [0]
+            spans=[(s,min(len(records)-1,s+W-1)) for s in starts]
     else:
         spans=[tuple(e) for e in eps]
     for k,(a,bb) in enumerate(spans):
@@ -293,10 +396,11 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
             v=np.array([r.get(c,float("nan")) for r in win],dtype=float)
             if len(v)==0 or np.all(np.isnan(v)): continue
             cs=_znorm(_resample(v))
-            de=float(np.sqrt(np.mean((cs-S[c])**2)))
-            dd=dtw_dist(cs,S[c])
+            Sc=_znorm(_resample(S[c]))   # эталон слепка тоже к N точкам: иначе broadcast-краш
+            de=float(np.sqrt(np.mean((cs-Sc)**2)))
+            dd=dtw_dist(cs,Sc)
             d+=0.3*de+0.7*dd; ok+=1
-            if not _morph_ok(v,S[c],dur_s,fps_proc): morph_fail=True
+            if not _morph_ok(v,Sc,dur_s,fps_proc): morph_fail=True
         if ok==0: continue
         if face_touch and morph_fail: continue   # строгий режим: форма кривой обязательна
         ft_frac=None
@@ -312,7 +416,10 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
     meta={"total":len(cands),"returned":len(keep),"version":SNAP_VERSION,"pattern":pid,
           "mode":mode,"episodes_of_pattern":len(eps),
           "patterns_in_snapshot":[PAT_DEFS[x][0] for x in range(len(PAT_DEFS)) if req&(1<<x)],
-          "channels":chans,"snapshot_duration":dur_s}
+          "channels":chans,"snapshot_duration":dur_s,
+          "face_touch_gate":bool(face_touch),"strict_face_touch":bool(strict_ft),
+          "snapshot_touch_frac":round(float(frac_touch),2)}
+    if meta_note: meta["note"]=meta_note
     return keep,meta
 
 def _segment_bounds(records,t0,t1):

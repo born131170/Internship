@@ -128,6 +128,17 @@ def truth(vid: str):
     if isinstance(dp,dict) and isinstance(dp.get("score"),(int,float)):
         out["heuristic"]=round(dp["score"])
         out["psych"]=_clean(dp)
+    # Вердикт LLM включаем сразу, если llm_result.json уже лежит на диске:
+    # без этого плашка «Вердикт LLM» оставалась «ожидает LLM-анализа» даже после
+    # успешного анализа (гонка: фронт читал /truth до обновления RESULT в памяти).
+    try:
+        lr=json.loads((_vdir(vid)/"llm_result.json").read_text(encoding="utf-8"))
+        t=(lr.get("parsed") or {}).get("truthfulness")
+        if isinstance(t,dict) and isinstance(t.get("score"),(int,float)):
+            out["llm_verdict"]={"score":t["score"],"verdict":t.get("verdict",""),
+                                "cues":[c for c in (t.get("cues") or []) if isinstance(c,dict)]}
+    except Exception:
+        pass
     return out
 
 @app.get("/api/videos/{vid}/file")
@@ -256,6 +267,7 @@ def llm_analyze(vid: str, payload: dict = None):
     if st and st.get("state")=="running":
         return {"state":"running","msg":st.get("msg","")}
     def run():
+        nonlocal st
         st.update(state="running",msg="запрос к LLM…")
         try:
             scores=scoring.compute_scores(s)
@@ -321,13 +333,13 @@ def llm_analyze(vid: str, payload: dict = None):
 @app.get("/api/videos/{vid}/llm/status")
 def llm_analyze_status(vid: str):
     st=LLM_JOBS.get(vid)
-    if not st:
+    if not st or st.get("state")=="idle":
         d=_vdir(vid)
         if (d/"llm_result.json").exists():
             return {"state":"done","result":json.loads((d/"llm_result.json").read_text(encoding="utf-8")),"msg":"готово (с диска)"}
         return {"state":"idle","msg":""}
     out={"state":st["state"],"msg":st.get("msg","")}
-    if st["state"]=="done": out["result"]=st["result"]
+    if st["state"]=="done": out["result"]=st.get("result")
     if st["state"]=="error": out["error"]=st.get("error")
     return out
 
