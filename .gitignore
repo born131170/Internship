@@ -1,2 +1,2 @@
-# Common compressed files
-*.zip
+__pycache__/
+*.pyc

@@ -16,6 +16,30 @@ def _g(st,ch,key="mean"):
     d=(st or {}).get(ch) or {}
     return d.get(key)
 
+def primary_big_five(s):
+    """Единый источник числовых Big Five для всего приложения (UI, LLM, экспорт).
+    Приоритет: детерминированный психометрический слой движка (LR-агрегация по
+    валидированным индикаторам с 95% ДИ, psychometrics.py) — если он посчитан.
+    Иначе — запасной z-композит scoring v1 (помечается _engine="z-composite")."""
+    ps=s.get("personality") if isinstance(s,dict) else None
+    bf=(ps or {}).get("big_five") if isinstance(ps,dict) else None
+    det=(bf or {}).get("_detail") if isinstance(bf,dict) else None
+    keys=("openness","conscientiousness","extraversion","agreeableness","neuroticism")
+    if isinstance(det,dict):
+        vals={k:(det.get(k) or {}).get("score") for k in keys}
+        got=[k for k in keys if isinstance(vals[k],(int,float))]
+        if len(got)>=3:
+            out=dict(vals)
+            for k in keys:
+                if not isinstance(out[k],(int,float)): out[k]=50.0
+            out["_engine"]="psychometrics-LR"
+            out["ci95"]={k:(det.get(k) or {}).get("ci95") for k in keys}
+            out["n_indicators"]={k:(det.get(k) or {}).get("n_indicators") for k in keys}
+            out["notes"]=("детерминированная LR-агрегация по невербальным индикаторам "
+                          "(Borkenau 2010; Naumann 2009; Hall&Carter 2016 meta); см. глоссарий")
+            return out
+    return None
+
 def compute_scores(s):
     c=s.get("counters",{}); st=s.get("stats",{}); cues=s.get("truth_cues",{}); au=s.get("audio") or {}
     nf=max(1,s.get("n_frames",1))
@@ -59,10 +83,27 @@ def compute_scores(s):
     used=[smile,tension,avoid,act,men,speech,rate,f0std]
     cov=round(sum(1 for v in used if v not in (None,0))/max(1,len(used)),2)
     ae=auto_evidence(s)
-    return {"big_five":bf,"mbti":mbti,"enneagram":enn,"temperament":temp,"hexaco":hexa,"pid5":pid5,"auto_evidence":ae,
-            "truthfulness":{"score":s.get("truth_heuristic",50),
-                            "verdict":"невербальный приор (формула в evidence); не установленная правдивость"},
-            "coverage":cov,"scoring_method":SCORING_METHOD,"version":"1.0"}
+    out={"big_five":bf,"mbti":mbti,"enneagram":enn,"temperament":temp,"hexaco":hexa,"pid5":pid5,"auto_evidence":ae,
+         "truthfulness":{"score":s.get("truth_heuristic",50),
+                         "verdict":"невербальный приор нагрузки/утечки (формула в evidence); НЕ вероятность лжи"},
+         "coverage":cov,"scoring_method":SCORING_METHOD,"version":"1.1"}
+    # Единый источник Big Five: если посчитан психометрический слой движка (LR-агрегация,
+    # 95% ДИ, кадры-доказательства) — он и есть основные шкалы OCEAN. Запасной z-композит
+    # остаётся только при его отсутствии; две расходящиеся шкалы в UI больше не показываются.
+    det=primary_big_five(s)
+    if det is not None:
+        out["big_five"]={**det,"notes":det["notes"]}
+        out["_engine"]="psychometrics-LR"
+        out["ci95"]=det.get("ci95"); out["n_indicators"]=det.get("n_indicators")
+        # производные системы пересчитываем по единым осям, чтобы MBTI/PID-5 не противоречили OCEAN
+        E,N,A,C,O=det["extraversion"],det["neuroticism"],det["agreeableness"],det["conscientiousness"],det["openness"]
+        axes=out["mbti"]["axes"]; axes.update({"E_I":E,"S_N":O,"T_F":A,"J_P":C})
+        out["mbti"]["type"]=("E" if E>50 else "I")+("N" if O>50 else "S")+("F" if A>50 else "T")+("J" if C>50 else "P")
+        out["mbti"]["notes"]="оси = единый детерминированный профиль Big Five (psychometrics-LR)"
+        out["hexaco"].update({"E":N,"X":E,"A":A,"C":C,"O":O})
+        out["pid5"].update({"negative_affect":N,"detachment":_clip(100-E),"antagonism":_clip(100-A),"disinhibition":_clip(100-C)})
+        out["enneagram"]["score"]=_clip(55+abs(E-50)/2+abs(N-50)/2)
+    return out
 
 SYS_PATTERNS={"big_five":["P10","P11","P04","P03","P12"],"mbti":["P03","P10","P07","P09"],
  "enneagram":["P02","P11"],"temperament":["P04","P09","P11","P10"],"hexaco":["P10","P12","P06"],
@@ -90,9 +131,12 @@ def enrich_parsed(parsed, s, min_items=2, max_items=6):
     if not isinstance(parsed,dict): return parsed
     ev=parsed.get("evidence")
     if not isinstance(ev,dict): ev={}; parsed["evidence"]=ev
-    ae=auto_evidence(s,max_items)
+    try:
+        ae=auto_evidence(s,max_items)
+    except Exception:
+        return parsed
     for key,auto in ae.items():
-        cur=[x for x in ev.get(key,[]) if isinstance(x,dict)]
+        cur=[x for x in (ev.get(key) or []) if isinstance(x,dict)]
         have={x.get("episode_id") for x in cur}
         for a in auto:
             if len(cur)>=min_items: break

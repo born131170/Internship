@@ -267,12 +267,46 @@ def _draw_series(canvas,x0,y0,w,h,hist,ymin,ymax,color,fill=True,step=False):
         cv2.addWeighted(tmp,0.16,sub,0.84,0,sub)
     cv2.polylines(canvas,[P],False,color,1,cv2.LINE_AA)
 
+def blink_events(records):
+    """Единый для всего приложения детектор морганий (P01).
+    eyeBlink blendshape в MediaPipe при stride-сэмплинге часто залипает между кадрами
+    либо никогда не превышает порог 0.6 -> raw-порог даёт вечную активность или 0 событий.
+    Здесь: переходы выше порога закрытия век (>=0.5) с рефрактерным интервалом 200 мс
+    (физиологическое время закрытия век ~100-150 мс; Doughty 1989). Возвращает индексы кадров-вершин."""
+    thr=0.5
+    dur=(records[-1]["t"]-records[0]["t"]) if len(records)>1 else 0.0
+    refr=max(1,int(round(0.2*len(records)/dur))) if dur>0 else 1
+    peaks=[]; closed=False; last=-10**9
+    for i,r in enumerate(records):
+        v=r.get("blink")
+        if v is None or (isinstance(v,float) and math.isnan(v)): continue
+        if v>=thr and not closed:
+            if i-last>=refr: peaks.append(i)
+            closed=True; last=i
+        elif v<thr*0.5: closed=False
+    return peaks
+
 def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, width=480, per_pat=0, models_dir=Path("models")):
     eps=[]; n=len(records)
     pnames={pid:nm for pid,nm,_ in PATTERN_DEFS}
     if n<4: return eps
     GAP=max(1,int(0.4*fps_proc)); MIN=max(2,int(0.6*fps_proc))
+    blinks=blink_events(records)
     for pid,pname,fn in PATTERN_DEFS:
+        if pid=="P01":
+            # эпизоды = сами события моргания (по одному кадру-вершине)
+            for k,i in enumerate(blinks):
+                def _mval0(ch,idx=i):
+                    v=records[idx].get(ch)
+                    return round(float(v),4) if isinstance(v,(int,float)) and not (isinstance(v,float) and math.isnan(v)) else None
+                metrics={ch:_mval0(ch) for ch in ("smile","cheek","blink","hand_speed","hfd","tif","menergy","yc","pc","f0","rms","pause")}
+                metrics["hands_max"]=int(records[i].get("hands",0) or 0)
+                eps.append({"id":f"P01_{k:02d}","pattern":"P01","name":pname,
+                            "t0":round(records[i]["t"],2),"t1":round(records[i]["t"],2),
+                            "mid":round(records[i]["t"],2),"frames":1,
+                            "thumb":f"episodes/P01_{k:02d}.jpg","clip":f"episodes/P01_{k:02d}.mp4",
+                            "metrics":metrics})
+            continue
         act=[bool(fn(r)) for r in records]; ints=[]; start=None; last=-10
         for i,a in enumerate(act):
             if a:
@@ -352,7 +386,9 @@ def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, wid
         except Exception:
             pass
         nm=pnames.get(ep["pattern"],ep["name"])
-        lines=[f"{ep['pattern']} {nm}  t={ep['t0']:.1f}-{ep['t1']:.1f}s"]
+        # cv2.FONT_HERSHEY_SIMPLEX не поддерживает кириллицу (символы -> '?') —
+        # подпись кадра-доказательства печатается латиницей.
+        lines=[f"{ep['pattern']} GESTURE/MOTION  t={ep['t0']:.1f}-{ep['t1']:.1f}s"]
         mm=ep.get("metrics") or {}
         kv=[f"{k}={mm[k]}" for k in ("smile","cheek","blink","hand_speed","hfd","tif","menergy","yc","pc","f0","pause") if mm.get(k) is not None][:6]
         if kv: lines.append(", ".join(kv))
@@ -632,7 +668,10 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
     with (out_dir/"metrics.jsonl").open("w",encoding="utf-8") as f:
         for r in records: f.write(json.dumps(r,ensure_ascii=False)+"\n")
     counters={}; events={}
+    blinks=blink_events(records)
     for pid,_,fn in PATTERN_DEFS:
+        if pid=="P01":
+            counters["P01"]=len(blinks); events["P01"]=len(blinks); continue
         c=e=0; prev=False
         for r in records:
             a=bool(fn(r))
@@ -696,6 +735,9 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
         try:
             import psychometrics
             psych=psychometrics.assess(records, summary=None)
+            # single source of truth: blink-частота движка = тот же детектор, что и эпизоды P01
+            if psych and blinks:
+                psych.setdefault("behavior", {})["blink_rate_bpm"]=round(len(blinks)/dur*60,1) if dur>0 else None
             _attach_psych_evidence(psych, episodes)
         except Exception:
             import traceback as _tb

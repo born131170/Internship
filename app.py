@@ -120,7 +120,40 @@ def metrics(vid: str): return _clean(_metrics(_vdir(vid)))
 @app.get("/api/videos/{vid}/truth")
 def truth(vid: str):
     s=json.loads((_vdir(vid)/"summary.json").read_text(encoding="utf-8"))
-    return {"cues":_clean(s["truth_cues"]),"heuristic":s["truth_heuristic"]}
+    # единый источник истины: если посчитан психометрический слой движка (load_index по
+    # валидированным маркерам нагрузки/арузала с указанием источников) — показываем его,
+    # а не старую ad-hoc эвристику pipeline (она давала "вечно 50" на тихих видео).
+    dp=((s.get("personality") or {}).get("truthfulness")) if isinstance(s.get("personality"),dict) else None
+    out={"cues":_clean(s["truth_cues"]),"heuristic":s["truth_heuristic"]}
+    if isinstance(dp,dict) and isinstance(dp.get("score"),(int,float)):
+        out["heuristic"]=round(dp["score"])
+        out["psych"]=_clean(dp)
+    # Вердикт LLM включаем сразу, если llm_result.json уже лежит на диске:
+    # без этого плашка «Вердикт LLM» оставалась «ожидает LLM-анализа» даже после
+    # успешного анализа (гонка: фронт читал /truth до обновления RESULT в памяти).
+    try:
+        lr=json.loads((_vdir(vid)/"llm_result.json").read_text(encoding="utf-8"))
+        t=(lr.get("parsed") or {}).get("truthfulness")
+        if isinstance(t,dict):
+            cues=[]
+            for c in (t.get("cues") or []):
+                # нормализация: модель может вернуть строки вместо объектов —
+                # иначе фронтенд печатает «undefined ()» на каждом пункте
+                if isinstance(c,dict):
+                    nm=str(c.get("cue") or c.get("name") or c.get("marker") or "").strip()
+                    dr=str(c.get("direction") or c.get("note") or "").strip()
+                    if nm: cues.append({"cue":nm,"direction":dr})
+                elif isinstance(c,str) and c.strip():
+                    cues.append({"cue":c.strip(),"direction":""})
+            sc=t.get("score")
+            vd=str(t.get("verdict") or "").strip()
+            if isinstance(sc,(int,float)) or vd or cues:
+                out["llm_verdict"]={"score":sc if isinstance(sc,(int,float)) else None,
+                                    "verdict":vd or "LLM вернул только cues без текста вердикта",
+                                    "cues":cues}
+    except Exception:
+        pass
+    return out
 
 @app.get("/api/videos/{vid}/file")
 def vfile(vid: str, path: str):
@@ -174,9 +207,23 @@ def del_snap(sid: str):
 
 @app.post("/api/snapshots/upload")
 async def upload_snap(file: UploadFile=File(...)):
-    data=json.loads(await file.read()); data.setdefault("id",uuid.uuid4().hex[:10])
+    # Валидация вместо 500 на битом JSON (исправление «кнопка не работает»)
+    try:
+        raw=(await file.read()).decode("utf-8-sig",errors="replace")
+        data=json.loads(raw)
+    except Exception as e:
+        return JSONResponse(status_code=422,content={"error":f"файл не является корректным JSON-слепком: {e}"})
+    if not isinstance(data,dict):
+        return JSONResponse(status_code=422,content={"error":"JSON должен быть объектом слепка"})
+    if not (isinstance(data.get("series"),dict) and data["series"]):
+        return JSONResponse(status_code=422,content={"error":"в слепке нет канала series — это не цифровой слепок"})
+    bad=[c for c,v in data["series"].items() if not isinstance(v,list)]
+    if bad:
+        return JSONResponse(status_code=422,content={"error":f"каналы не-списки: {bad}"})
+    data.setdefault("id",uuid.uuid4().hex[:10]); data["id"]=str(data["id"])[:40]
+    data["name"]=str(data.get("name","слепок"))[:80]
     (SNAP/f"{data['id']}.json").write_text(json.dumps(data,ensure_ascii=False),encoding="utf-8")
-    return {"id":data["id"]}
+    return {"id":data["id"],"name":data["name"],"channels":list(data["series"].keys())}
 
 @app.post("/api/videos/{vid}/search")
 def search(vid: str, payload: dict):
@@ -185,9 +232,11 @@ def search(vid: str, payload: dict):
         if sid: snap=json.loads((SNAP/f"{sid}.json").read_text(encoding="utf-8"))
         elif payload.get("snapshot"): snap=payload["snapshot"]
         else: return JSONResponse(status_code=422,content={"error":"нужен snapshot_id или snapshot"})
-        mode=payload.get("mode") or ("episodes" if snap.get("pattern") else "free")
+        mode=payload.get("mode") or None   # None -> автовыбор в snapshots.search
         res,meta=snapshots.search(recs,snap,hop=float(payload.get("hop",0.25)),
-                                  top_k=int(payload.get("top_k",10)),mode=mode)
+                                  top_k=int(payload.get("top_k",100)),mode=mode,
+                                  pattern=payload.get("pattern"),
+                                  face_touch=bool(payload.get("face_touch")))
         return {"snapshot":snap["id"],"results":res,"total":len(res),"meta":meta}
     except Exception as e:
         traceback.print_exc()
@@ -215,90 +264,111 @@ def test_cfg(payload: dict = None):
     except Exception as e:
         return JSONResponse(status_code=502,content={"ok":False,"error":llm.describe_error(e)})
 
-def _llm_job(vid: str, user_prompt: str):
-    """Фоновый LLM-аналитик: браузер не ждёт ответа API (защита от client/browser timeout)."""
-    j=LLM_JOBS[vid]
-    try:
-        d=_vdir(vid)
-        s=json.loads((d/"summary.json").read_text(encoding="utf-8"))
-        scores=scoring.compute_scores(s)
-        cfg=llm.load_config(DATA)
-        j.update(state="running",progress=0.15,msg="Запрос к LLM (модель готовит JSON-отчёт)…")
-        warnings=[]; evidence=llm.build_evidence(s); raw=None; finish=None
-        evidence["scores_block"]=scores
-        for cap in (4,2,0):
-            try:
-                j.update(progress=0.3+0.2*(4-cap)//4,
-                         msg=f"LLM-запрос (лимит доказательств ≤{cap} на систему)…")
-                raw,finish=llm.run_analysis(cfg,user_prompt,evidence,cite_cap=cap)
-                break
-            except Exception as e:
-                if cap==0 or not llm.is_retriable(e):
-                    traceback.print_exc()
-                    j.update(state="error",msg=llm.describe_error(e)); return
-                warnings.append(f"API: {llm.describe_error(e)} — повторный запрос с ограничением доказательств (≤{2 if cap==4 else 0} на системы)")
-        j.update(progress=0.75,msg="Разбор и валидация ответа…")
-        if finish=="length":
-            warnings.append("Ответ модели оборван на лимите токенов прокси (finish_reason=length)")
-        parsed=llm.parse_json(raw)
-        if parsed is None:
-            fixed=llm._repair_json((raw or "").strip())
-            if fixed is not None:
-                parsed=fixed; warnings.append("Локальная починка: оборванный JSON восстановлен закрытием скобок")
-        if parsed is None:
-            try:
-                raw2=llm.repair_json_response(cfg,raw or "")
-                parsed2=llm.parse_json(raw2)
-                if parsed2 is not None:
-                    raw=raw2; parsed=parsed2; warnings.append("Авторемонт: повторный запрос вернул валидный JSON")
-            except Exception as e:
-                warnings.append(f"Авторемонт не удался: {llm.describe_error(e)}")
-        if parsed is None:
-            warnings.append("Ответ модели не распарсен как JSON — результаты НЕ применены, смотрите RAW")
-        else:
-            parsed,w=llm.validate_result(parsed,s); warnings+=w
-            parsed=scoring.enrich_parsed(parsed,s)
-        res={"raw":raw,"parsed":parsed,"warnings":warnings,"scores":scores}
-        (d/"llm_result.json").write_text(json.dumps(res,ensure_ascii=False),encoding="utf-8")
-        j.update(state="done",progress=1.0,msg="Готово",result=res)
-    except Exception as e:
-        traceback.print_exc()
-        j.update(state="error",msg=f"Внутренняя ошибка сервера: {llm.describe_error(e)}")
-
 @app.post("/api/videos/{vid}/llm/analyze")
 def llm_analyze(vid: str, payload: dict = None):
+    """Фоновый LLM-анализ: мгновенный старт + опрос статуса (не зависит от таймаута прокси)."""
     payload=payload or {}
     try:
         d=_vdir(vid)
-        if not (d/"summary.json").exists():
-            return JSONResponse(status_code=409,content={"error":"Сначала выполните анализ видео (MediaPipe)"})
-        cfg=llm.load_config(DATA)
-        if not (cfg.get("base_url") and cfg.get("api_key") and cfg.get("model")):
-            return JSONResponse(status_code=409,content={"error":"LLM не настроен: укажите Base URL, API key и модель в «Настройки LLM» и нажмите «Сохранить»"})
-        cur=LLM_JOBS.get(vid)
-        if cur and cur.get("state")=="running":
-            return {"job_id":vid,"state":"running","accepted":True}
-        job={"state":"running","progress":0.0,"msg":"старт"}; LLM_JOBS[vid]=job
-        threading.Thread(target=_llm_job,args=(vid,payload.get("prompt") or llm.DEFAULT_USER_PROMPT),daemon=True).start()
-        return {"job_id":vid,"state":"started","accepted":True}
+        s=json.loads((d/"summary.json").read_text(encoding="utf-8"))
     except Exception as e:
         traceback.print_exc()
-        return JSONResponse(status_code=502,content={"error":f"Внутренняя ошибка сервера: {llm.describe_error(e)}"})
-
-@app.get("/api/llm/jobs/{vid}")
-def llm_job_status(vid: str):
-    j=LLM_JOBS.get(vid)
-    if not j:
-        # после перезапуска сервера — отдаём сохранённый результат, если он есть
+        return JSONResponse(status_code=404,content={"error":f"Нет данных анализа для видео {vid}: {e}"})
+    cfg=llm.load_config(DATA)
+    if not (cfg.get("base_url") and cfg.get("api_key") and cfg.get("model")):
+        return JSONResponse(status_code=409,content={"error":"LLM не настроен: укажите Base URL, API key и модель в «Настройки LLM» и нажмите «Сохранить»"})
+    st=LLM_JOBS.get(vid)
+    if st and st.get("state")=="running":
+        return {"state":"running","msg":st.get("msg","")}
+    def run():
+        nonlocal st
+        st.update(state="running",msg="запрос к LLM…")
         try:
-            p=_vdir(vid)/"llm_result.json"
-            if p.exists():
-                return {"state":"done","msg":"Из сохранённого результата","progress":1.0,"result":json.loads(p.read_text(encoding="utf-8"))}
-        except Exception: pass
-        return JSONResponse(status_code=404,content={"error":"Задача LLM-анализа не найдена"})
-    out=dict(j.__dict__)
-    if out.get("state")=="done": out["result"]=out.pop("result",None)
-    else: out.pop("result",None)
+            scores=scoring.compute_scores(s)
+            warnings=[]; evidence=llm.build_evidence(s); raw=None; finish=None
+            evidence["scores_block"]=scores
+            for cap in (4,2,0):
+                try:
+                    raw,finish=llm.run_analysis(cfg,payload.get("prompt") or llm.DEFAULT_USER_PROMPT,evidence,cite_cap=cap)
+                    break
+                except Exception as e:
+                    if cap==0 or not llm.is_retriable(e):
+                        traceback.print_exc()
+                        st.update(state="error",error=llm.describe_error(e),msg="ошибка"); return
+                    warnings.append(f"API: {llm.describe_error(e)} — повторный запрос с ограничением доказательств (≤{2 if cap==4 else 0} на систему)")
+                    st.update(msg=f"повтор запроса (лимит доказательств ≤{2 if cap==4 else 0})…")
+            if finish=="length":
+                warnings.append("Ответ модели оборван на лимите токенов прокси (finish_reason=length)")
+            parsed=llm.parse_json(raw)
+            if parsed is None:
+                fixed=llm._repair_json((raw or "").strip())
+                if fixed is not None:
+                    parsed=fixed; warnings.append("Локальная починка: оборванный JSON восстановлен закрытием скобок")
+            if parsed is None:
+                st.update(msg="авторемонт JSON…")
+                try:
+                    raw2=llm.repair_json_response(cfg,raw or "")
+                    parsed2=llm.parse_json(raw2)
+                    if parsed2 is not None:
+                        raw=raw2; parsed=parsed2; warnings.append("Авторемонт: повторный запрос вернул валидный JSON")
+                except Exception as e:
+                    warnings.append(f"Авторемонт не удался: {llm.describe_error(e)}")
+            if parsed is None:
+                warnings.append("Ответ модели не распарсен как JSON — результаты НЕ применены, смотрите RAW")
+            else:
+                try:
+                    parsed,w=llm.validate_result(parsed,s); warnings+=w
+                except Exception as e:
+                    warnings.append(f"Валидация ответа: {e}")
+                try:
+                    parsed=scoring.enrich_parsed(parsed,s)
+                except Exception as e:
+                    warnings.append(f"Автодоказательства: {e}")
+                if isinstance(parsed,dict):
+                    # честный confidence вместо всегда-нулевого из схемы модели
+                    parsed["confidence"]=llm.compute_confidence(parsed,warnings)
+                    # truthfulness: нормализуем verdict и cues — модель часто
+                    # возвращает пустой текст или cues строками/объектами без поля
+                    # "cue", из-за чего во фронте печаталось «undefined ()»
+                    t=parsed.get("truthfulness")
+                    if isinstance(t,dict):
+                        if not str(t.get("verdict") or "").strip():
+                            sc=scores.get("truthfulness") if isinstance(scores,dict) else None
+                            tv=(sc or {}).get("verdict") if isinstance(sc,dict) else None
+                            t["verdict"]=tv or f"Детерминированная эвристика: {(sc or {}).get('score','—')}/100 — невербальный приор нагрузки/утечки (не вероятность лжи)"
+                        nc=[]
+                        for c in (t.get("cues") or []):
+                            if isinstance(c,dict):
+                                nm=str(c.get("cue") or c.get("name") or c.get("marker") or "").strip()
+                                dr=str(c.get("direction") or c.get("note") or "").strip()
+                                if nm: nc.append({"cue":nm,"direction":dr})
+                            elif isinstance(c,str) and c.strip():
+                                nc.append({"cue":c.strip(),"direction":""})
+                        t["cues"]=nc
+                        if not isinstance(t.get("score"),(int,float)):
+                            t["score"]=(scores.get("truthfulness") or {}).get("score") if isinstance(scores,dict) else None
+            result={"raw":raw,"parsed":parsed,"warnings":warnings,"scores":scores}
+            (d/"llm_result.json").write_text(json.dumps(result,ensure_ascii=False),encoding="utf-8")
+            st.update(state="done",result=result,msg="готово")
+        except Exception as e:
+            traceback.print_exc()
+            st.update(state="error",error=f"Внутренняя ошибка сервера: {llm.describe_error(e)}",msg="ошибка")
+    st={"state":"queued","msg":"подготовка запроса…","result":None,"error":None,"thread":None}
+    LLM_JOBS[vid]=st
+    t=threading.Thread(target=run,daemon=True); st["thread"]=t; t.start()
+    return {"state":"running","started":True}
+
+@app.get("/api/videos/{vid}/llm/status")
+def llm_analyze_status(vid: str):
+    st=LLM_JOBS.get(vid)
+    if not st or st.get("state")=="idle":
+        d=_vdir(vid)
+        if (d/"llm_result.json").exists():
+            return {"state":"done","result":json.loads((d/"llm_result.json").read_text(encoding="utf-8")),"msg":"готово (с диска)"}
+        return {"state":"idle","msg":""}
+    out={"state":st["state"],"msg":st.get("msg","")}
+    if st["state"]=="done": out["result"]=st.get("result")
+    if st["state"]=="error": out["error"]=st.get("error")
     return out
 
 SYSREP=[("big_five","Big Five",lambda p:[("Openness",p.get("openness")),("Conscientiousness",p.get("conscientiousness")),("Extraversion",p.get("extraversion")),("Agreeableness",p.get("agreeableness")),("Neuroticism",p.get("neuroticism"))]),
