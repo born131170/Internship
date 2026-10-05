@@ -120,7 +120,15 @@ def metrics(vid: str): return _clean(_metrics(_vdir(vid)))
 @app.get("/api/videos/{vid}/truth")
 def truth(vid: str):
     s=json.loads((_vdir(vid)/"summary.json").read_text(encoding="utf-8"))
-    return {"cues":_clean(s["truth_cues"]),"heuristic":s["truth_heuristic"]}
+    # единый источник истины: если посчитан психометрический слой движка (load_index по
+    # валидированным маркерам нагрузки/арузала с указанием источников) — показываем его,
+    # а не старую ad-hoc эвристику pipeline (она давала "вечно 50" на тихих видео).
+    dp=((s.get("personality") or {}).get("truthfulness")) if isinstance(s.get("personality"),dict) else None
+    out={"cues":_clean(s["truth_cues"]),"heuristic":s["truth_heuristic"]}
+    if isinstance(dp,dict) and isinstance(dp.get("score"),(int,float)):
+        out["heuristic"]=round(dp["score"])
+        out["psych"]=_clean(dp)
+    return out
 
 @app.get("/api/videos/{vid}/file")
 def vfile(vid: str, path: str):
