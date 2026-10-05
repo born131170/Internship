@@ -352,7 +352,9 @@ def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, wid
         except Exception:
             pass
         nm=pnames.get(ep["pattern"],ep["name"])
-        lines=[f"{ep['pattern']} {nm}  t={ep['t0']:.1f}-{ep['t1']:.1f}s"]
+        # cv2.FONT_HERSHEY_SIMPLEX не поддерживает кириллицу (символы -> '?') —
+        # подпись кадра-доказательства печатается латиницей.
+        lines=[f"{ep['pattern']} GESTURE/MOTION  t={ep['t0']:.1f}-{ep['t1']:.1f}s"]
         mm=ep.get("metrics") or {}
         kv=[f"{k}={mm[k]}" for k in ("smile","cheek","blink","hand_speed","hfd","tif","menergy","yc","pc","f0","pause") if mm.get(k) is not None][:6]
         if kv: lines.append(", ".join(kv))

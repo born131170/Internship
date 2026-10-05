@@ -275,6 +275,15 @@ def llm_analyze(vid: str, payload: dict = None):
                     parsed=scoring.enrich_parsed(parsed,s)
                 except Exception as e:
                     warnings.append(f"Автодоказательства: {e}")
+                if isinstance(parsed,dict):
+                    # честный confidence вместо всегда-нулевого из схемы модели
+                    parsed["confidence"]=llm.compute_confidence(parsed,warnings)
+                    # truthfulness.verdict: не оставляем заглушку "ожидает LLM-анализа"
+                    t=parsed.get("truthfulness")
+                    if isinstance(t,dict) and not (t.get("verdict") or "").strip():
+                        sc=scores.get("truthfulness") if isinstance(scores,dict) else None
+                        tv=(sc or {}).get("verdict") if isinstance(sc,dict) else None
+                        t["verdict"]=tv or f"Детерминированная эвристика: {scores.get('truthfulness',{}).get('score','—')}/100 — невербальный приор нагрузки/утечки (не вероятность лжи)"
             result={"raw":raw,"parsed":parsed,"warnings":warnings,"scores":scores}
             (d/"llm_result.json").write_text(json.dumps(result,ensure_ascii=False),encoding="utf-8")
             st.update(state="done",result=result,msg="готово")
