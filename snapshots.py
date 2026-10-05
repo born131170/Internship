@@ -330,6 +330,19 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         # независимо от маски слепка (в т.ч. старых v4.0 с "веером")
         p06=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]=="P06"]
         if p06: active=p06
+    # ДОМИНИРУЮЩИЙ паттерн по всему видео: если в окне слепка активен «веер» из
+    # 10+ паттернов (старые слепки v4.0), выбор одного целевого паттерна по окну
+    # слепка ненадёжен. Берём самый частотный паттерн во всём видео и строим
+    # эпизоды по нему — это восстанавливает обычный поиск для не-touch слепков.
+    global_dominant=None
+    if not strict_ft and len(active)>3:
+        try:
+            freq={x:int(((mask>>x)&1).sum()) for x in range(len(PAT_DEFS))}
+            present=[x for x in active if freq.get(x,0)>0]
+            cand=present or [max(freq,key=lambda x:freq.get(x,0))]
+            global_dominant=max(cand,key=lambda x:(freq.get(x,0),-x))
+        except Exception:
+            global_dominant=None
     if len(active)>1:
         # Было: выбирался САМЫЙ РЕДКИЙ активный паттерн (cnt[0]) — при "веере" это
         # приводило к P11 с 0 эпизодами и пустому поиску. Теперь приоритет:
@@ -349,6 +362,9 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         # strict_ft + нет P06-эпизодов в видео: active остаётся = [P06] -> eps=[],
         # честный ответ 0 находок (см. ниже), без скатывания в free-скольжение
     b=active[0]; pid=PAT_DEFS[b][0]
+    if global_dominant is not None and len(active)>1:
+        # «веер» из окна слепка: целевой паттерн — самый частотный по всему видео
+        b=global_dominant; pid=PAT_DEFS[b][0]; active=[b]
     # ЯВНЫЙ выбор целевого паттерна пользователем (payload.pattern): пересчёт доли
     # активности этого паттерна в окне слепка. Без этого длинный слепок (несколько
     # жестов в одном окне) выбирал шумовой P07 вместо осмысленного P06, и поиск
