@@ -77,7 +77,8 @@ def ensure_mediapipe_gl():
 def ensure_python_deps():
     """Ставит pip-зависимости из requirements.txt, если какого-то модуля нет."""
     need_check = {"mediapipe": "mediapipe", "cv2": "opencv-python", "fastapi": "fastapi",
-                  "uvicorn": "uvicorn", "numpy": "numpy", "requests": "requests"}
+                  "uvicorn": "uvicorn", "numpy": "numpy", "httpx": "httpx",
+                  "imageio_ffmpeg": "imageio-ffmpeg", "pptx": "python-pptx"}
     missing = [pkg for mod, pkg in need_check.items() if importlib.util.find_spec(mod) is None]
     if not missing:
         return
@@ -96,10 +97,17 @@ if __name__ == "__main__":
     if not IS_WIN:
         ensure_mediapipe_gl()
     import uvicorn
-    port = int(os.environ.get("PORT", 8001 if IS_WIN else 8000))
-    print(f"[run] PersonaScope: http://127.0.0.1:{port}  (Ctrl+C — остановка сервера)")
+    port = int(os.environ.get("PORT", 8008 if IS_WIN else 8000))
+    # По умолчанию слушаем только loopback: приложение хранит ключ LLM и видео людей,
+    # пароля/авторизации в нём нет. Нужен доступ по сети — HOST=0.0.0.0 (ключ всё равно
+    # не отдаётся нелокальным клиентам, но видео и результаты станут доступны).
+    host = os.environ.get("HOST", "127.0.0.1")
+    shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    print(f"[run] PersonaScope: http://{shown}:{port}  (Ctrl+C — остановка сервера)")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"[run] ВНИМАНИЕ: сервер слушает {host} и доступен по сети без пароля.")
     try:
-        uvicorn.run("app:app", host="0.0.0.0", port=port, timeout_graceful_shutdown=3)
+        uvicorn.run("app:app", host=host, port=port, timeout_graceful_shutdown=3)
     except OSError as e:
         print(f"[run] Не удалось запустить сервер на порту {port}: {e}\n"
               f"[run] Задайте другой порт: set PORT=8080 (Windows) / export PORT=8080 (Linux)")

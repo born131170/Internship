@@ -1,6 +1,11 @@
-"""Детерминированный поведенческий скоринг v1: оценки 0..100 из метрик MediaPipe.
+"""Детерминированный поведенческий скоринг v1.2: оценки 0..100 из метрик MediaPipe.
 Формулы открыты (SCORING_METHOD), воспроизводимы, не зависят от LLM.
-z(x,a,s) = clip((x-a)/s, -2, 2); score = clip(50 + 8*sum(z), 5, 95)."""
+z(x,a,s) = clip((x-a)/s, -2, 2); score = clip(50 + 8*sum(z), 5, 95).
+
+Единый источник чисел для UI, LLM и экспорта: если посчитан психометрический слой
+движка (psychometrics.py, LR-агрегация), Big Five и правдивость берутся из него;
+z-композит ниже остаётся запасным вариантом для старых прогонов без personality.
+"""
 SCORING_METHOD=("z-якоря: smile 0.08/0.06; hand_speed 0.05/0.04; speech_ratio 0.5/0.25; tension 0.15/0.12; "
  "avoidance 0.10/0.08; blink_dev |bpm-20| 0/8; f0_std 25/15; head_yaw_std 0.12/0.08; emo_variety 3/1.5; "
  "fidget(P07) 0.25/0.15; nods(P02) 0.10/0.08; pose_shifts(P09) 0.30/0.20; speech_rate 4/1.5. "
@@ -69,8 +74,8 @@ def compute_scores(s):
     else: et=9
     enn={"type":et,"wing":f"{et}w{et+1 if et%2 else et-1}","score":_clip(55+abs(E-50)/2+abs(N-50)/2),
          "notes":"тип по квадрату E/N; операциональная гипотеза"}
-    san=max(2,E*(1-N/100)); chol=max(2,_clip(50+8*(_z(act,.05,.04)+_z(tension,.15,.12)))-0)
-    mel=max(2,(N*(1-E/100))/1); phl=max(2,_clip(50-8*(_z(act,.05,.04)+_z(tension,.15,.12)))-0)
+    san=max(2,E*(1-N/100)); chol=max(2,_clip(50+8*(_z(act,.05,.04)+_z(tension,.15,.12))))
+    mel=max(2,(N*(1-E/100))/1); phl=max(2,_clip(50-8*(_z(act,.05,.04)+_z(tension,.15,.12))))
     tot=san+chol+mel+phl
     temp={"sanguine":round(san/tot*100),"choleric":round(chol/tot*100),
           "melancholic":round(mel/tot*100),"phlegmatic":round(phl/tot*100),
@@ -83,10 +88,20 @@ def compute_scores(s):
     used=[smile,tension,avoid,act,men,speech,rate,f0std]
     cov=round(sum(1 for v in used if v not in (None,0))/max(1,len(used)),2)
     ae=auto_evidence(s)
+    # Единый источник правдивости: психометрический слой движка (валидированные маркеры
+    # нагрузки/арузала, psychometrics.deception_priority), если он посчитан. Запасной вариант —
+    # ad-hoc формула pipeline.truth_heuristic. Раньше эти два числа показывались одновременно
+    # (датчик /truth — одно, «Score» в вердикте LLM — другое), теперь источник один.
+    psi=(s.get("personality") or {}).get("truthfulness") if isinstance(s.get("personality"),dict) else None
+    psi=psi if isinstance(psi,dict) else {}
+    det_truth=psi.get("score") if isinstance(psi.get("score"),(int,float)) else None
+    truth_src="psychometrics-load" if det_truth is not None else "pipeline-heuristic"
+    truth_score=round(float(det_truth)) if det_truth is not None else s.get("truth_heuristic",50)
+    truth_verdict=(str(psi.get("verdict")) if truth_src=="psychometrics-load" and psi.get("verdict")
+                   else "невербальный приор нагрузки/утечки (формула в evidence); НЕ вероятность лжи")
     out={"big_five":bf,"mbti":mbti,"enneagram":enn,"temperament":temp,"hexaco":hexa,"pid5":pid5,"auto_evidence":ae,
-         "truthfulness":{"score":s.get("truth_heuristic",50),
-                         "verdict":"невербальный приор нагрузки/утечки (формула в evidence); НЕ вероятность лжи"},
-         "coverage":cov,"scoring_method":SCORING_METHOD,"version":"1.1"}
+         "truthfulness":{"score":truth_score,"verdict":truth_verdict,"source":truth_src},
+         "coverage":cov,"scoring_method":SCORING_METHOD,"version":"1.2"}
     # Единый источник Big Five: если посчитан психометрический слой движка (LR-агрегация,
     # 95% ДИ, кадры-доказательства) — он и есть основные шкалы OCEAN. Запасной z-композит
     # остаётся только при его отсутствии; две расходящиеся шкалы в UI больше не показываются.
@@ -112,15 +127,22 @@ SYS_PATTERNS={"big_five":["P10","P11","P04","P03","P12"],"mbti":["P03","P10","P0
 def _tc(t): return f"{int(t//60):02d}:{int(t%60):02d}"
 
 def auto_evidence(s, max_items=4):
-    """Детерминированные скрин-кадры доказательств по релевантным паттернам каждой системы."""
-    eps=s.get("episodes",[]); out={}
+    """Детерминированные скрин-кадры доказательств по релевантным паттернам каждой системы.
+    Устойчиво к неполным эпизодам: старые/внешние summary могут не содержать name/t0/t1/frames
+    (раньше это роняло /api/videos/{id}/scores с KeyError)."""
+    eps=s.get("episodes") or []
+    out={}
     for key,pats in SYS_PATTERNS.items():
         items=[]
         for pid in pats:
             for e in eps:
-                if e["pattern"]!=pid: continue
-                items.append({"episode_id":e["id"],"timecode":_tc(e["t0"])+"-"+_tc(e["t1"]),
-                              "rationale":f"[auto] маркер {pid} ({e['name']}), окно {e['t0']}-{e['t1']} c, {e['frames']} кадров — вход композита системы"})
+                if not isinstance(e,dict) or e.get("pattern")!=pid: continue
+                eid=e.get("id")
+                if not eid: continue
+                t0=e.get("t0"); t1=e.get("t1"); fr=e.get("frames")
+                tc=(_tc(t0)+"-"+_tc(t1)) if isinstance(t0,(int,float)) and isinstance(t1,(int,float)) else ""
+                items.append({"episode_id":eid,"timecode":tc,
+                              "rationale":f"[auto] маркер {pid} ({e.get('name') or pid}), окно {t0}-{t1} c, {fr} кадров — вход композита системы"})
                 if len(items)>=max_items: break
             if len(items)>=max_items: break
         out[key]=items

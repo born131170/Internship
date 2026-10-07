@@ -200,14 +200,16 @@ Evidence — цитируемые моделью эпизоды, сверяем�
 Эвристика правдивости — невербальный приор (формула передаётся модели в evidence). LLM/API — внешняя модель через OpenAI-совместимый эндпоинт.
 Shrinkage — заполнение блока без скорингов популяционной нормой (50 / 50-50 / 25×4) с предупреждением, вместо прочерков.<br>
 <b>LR (likelihood ratio, отношение правдоподобия)</b> — во сколько раз измеренное значение индикатора повышает (LR&gt;1, «за») или понижает (LR&lt;1, «против») шансы черты; агрегация черт Big Five = логистический перенос суммы ln(LR) в шкалу 0..100. Пороговые LR калиброваны по мета-аналитическим размерам эффекта (см. psychometrics.NORM_SOURCES).<br>
-<b>CI95 (95% доверительный интервал)</b> — диапазон, в котором с вероятностью 95% лежит истинная оценка черты; рассчитывается бутстрапом по эпизодам. Широкий CI = мало данных/низкая репрезентативность.<br>
+<b>CI95 (95% доверительный интервал)</b> — аналитическая оценка неопределённости: полуширина 1.96·15·se/2, где se = 1/√(число независимых индикаторов). Это НЕ бутстрап по эпизодам и не интервал прогноза: он отражает только объём доступных индикаторов, поэтому трактовать его как «истинную оценку черты» нельзя.<br>
 <b>Tier (уровень доказательства)</b> — сила индикатора: strong (прямая мета-аналитическая связь), moderate (устойчивая корреляция), weak (косвенный маркер). Индикаторы tier=weak имеют ограниченный вес в LR-сумме.<br>
 <b>n_indicators</b> — число независимых индикаторов, вошедших в оценку черты; при n&lt;3 оценка помечается low_data.<br>
 <b>Duchenne-улыбка (AU6+AU12)</b> — улыбка с непроизвольным сокращением круговой мышцы глаза; единственный мимический маркер с валидированной связью с позитивным аффектом (Ekman &amp; Davidson, 1994).<br>
 <b>tension (индекс напряжения)</b> — доля времени с browDown&gt;0.3 или press&gt;0.2 (AU4/AU24) — операционализация конструкта мышечного напряжения (Cacioppo et al., 2000).<br>
-<b>avoidance_ratio</b> — доля времени с |yc|&gt;35° (отведение головы/взгляда от медианы) — операционализация gaze avoidance (Kleinke, 1986).<br>
-<b>speech_ratio</b> — доля длительности видео с активной речью (VAD); <b>hand_face_ratio</b> — частота касаний лица на минуту (adaptors, Kaitz et al., 2007).<br>
-<b>coverage</b> — доля каналов метрик с ненулевыми данными (0..1): низкая coverage = видео плохого качества, оценки снижаются к норме.<br>
+<b>avoidance_ratio</b> — доля времени с |yc|&gt;25° от медианы (отведение взгляда по yaw; pitch не учитывается — кивок не является отведением) — операционализация gaze avoidance (Kleinke, 1986).<br>
+<b>speech_ratio</b> — доля длительности видео с активной речью (VAD); <b>hand_face_ratio</b> — доля кадров с касанием лица рукой (adaptors, Kaitz et al., 2007).<br>
+<b>AU6 / P10D (Duchenne)</b> — сжатие вертикального разреза глаза относительно ширины (FACS AU6): max(blendshape cheekRaise, геометрия глаза). В mediapipe 1.0.0 cheekRaise на референсных видео равен нулю во всех кадрах, поэтому решает геометрия.<br>
+<b>Пауза в речи (P14)</b> — тишина 0.5–3 c, начавшаяся не позже 5 c после речи; длинная тишина и видео без речи паузами не считаются.<br>
+<b>coverage</b> — доля из 8 ключевых каналов метрик, по которым есть данные (0..1). Низкая coverage означает, что часть индикаторов недоступна: соответствующие черты получают статус partial/insufficient_data, а отсутствующие блоки ответа модели заполняются популяционной нормой (shrinkage) с предупреждением — сами баллы при этом не «подтягиваются» к норме автоматически.<br>
 <b>Фоновый режим LLM</b> — POST /llm/analyze мгновенно возвращает «started», сервер считает в отдельном потоке, браузер опрашивает GET /llm/status каждые 3 c; таймаут HTTP-запроса к API модели настраивается переменной окружения LLM_TIMEOUT (по умолчанию 180 c).
 </div></div>
 <div class="syscard"><h3>Системы личности</h3><div class="lbl">
@@ -231,10 +233,10 @@ const PNAMES={P01:"Моргание",P02:"Кивок при слушании",P0
  P13:"Вокализация (речь)",P14:"Пауза в речи ≥0.5 c"};
 let VID=null,SUM=null,MET=null,RESULT=null,POLL=null,PATS=null,EPSC=null,EPS=null,SEARCH_VID=null;
 const EQ=[["P01",0.6,">"],["P02",0.08,">"],["P03",0.03,">"],["P04",0.03,">"],["P05",0.1,">"],["P06",1.0,"<"],
-["P07",0.01,">"],["P08",0.8,"<"],["P09",0.02,">"],["P10",0.4,">"],["P10D",1.0,">"],["P11",0.3,">"],["P12",0.2,">"],
+["P07",0.01,">"],["P08",0.8,"<"],["P09",0.02,">"],["P10",0.4,">"],["P10D",1.0,">"],["P11",0.3,">"],["P12",0.436,">"],
 ["P13",1.0,">"],["P14",0.5,">"]];
 let MULT={}; try{MULT=JSON.parse(localStorage.ps_mult||"{}")}catch(e){MULT={}}
-const CH_LIST=["smile","blink","jawO","browUp","browDown","eyeWide","yc","pc","hand_speed","aperture","hfd","hfd2","tif","menergy","rms","f0","srate"];
+const CH_LIST=["smile","blink","jawO","browUp","browDown","eyeWide","yc","pc","hand_speed","aperture","hfd","hfd2","tif","menergy","ocu","rms","f0","srate"];
 const fmt=t=>{t=Math.max(0,t|0);return String(t/60|0).padStart(2,"0")+":"+String(t%60).padStart(2,"0")};
 $$("nav button").forEach(b=>b.onclick=()=>{$$("nav button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
   $$("main section").forEach(s=>s.hidden=true);$("#p-"+b.dataset.p).hidden=false;});
@@ -267,7 +269,7 @@ async function loadDash(){SUM=await api(`/api/videos/${VID}/summary`); MET=await
   const dv=$("#dashVideo");
   if(!dv.dataset.hook){dv.dataset.hook="1"; dv.addEventListener("timeupdate",syncLeds);}
   dv.onerror=()=>{ if(dv.dataset.fb) return; dv.dataset.fb="1";
-    $("#dashHint").textContent="H.264-версия не найдена: открыт исходный mp4v. Выполните python fix_final2.py rerun";
+    $("#dashHint").textContent="H.264-версия недоступна: открыт исходный mp4v. Установите imageio-ffmpeg (pip install imageio-ffmpeg) и перезапустите сервер";
     dv.src=`/api/videos/${VID}/file?path=dashboard.mp4`; };
   dv.dataset.fb=""; dv.src=`/api/videos/${VID}/file?path=dashboard_web.mp4`;
   $("#inds").innerHTML=Object.keys(SUM.pattern_names).map(p=>`<div class="ind"><span class="led" id="led_${p}"></span><span>${p}: ${PNAMES[p]||SUM.pattern_names[p]}</span><span class="ct" id="ct_${p}">0</span></div>`).join("");
@@ -276,8 +278,10 @@ async function loadDash(){SUM=await api(`/api/videos/${VID}/summary`); MET=await
   RESULT=await api(`/api/videos/${VID}/llm/result`); try{ window.SCORES=await api(`/api/videos/${VID}/scores`); }catch(_){ window.SCORES=null; } renderAnalysis(); refreshSnaps();}
 function eqLabel(p,mu){ const d=EQ.find(x=>x[0]===p);
   if(p==="P06") return `box×1.30 / 3D<${(0.8*mu).toFixed(2)}`;
-  if(p==="P10D") return mu<=1?"smile>.35 cheek>.15":`cheek>${(0.15*mu).toFixed(2)}`;
-  if(p==="P13") return mu<=1?"речь активна (VAD)":`rms>${(0.005*mu).toFixed(3)}`;
+  if(p==="P10D") return mu<=1?"smile>.35 AU6>.15":`AU6>${(0.15*mu).toFixed(2)}`;
+  if(p==="P12") return `|yaw|>${(25*mu).toFixed(0)}°`;
+  if(p==="P13") return "речь активна (VAD)";
+  if(p==="P14") return `пауза ${(0.5*mu).toFixed(2)}–3 c в речи`;
   return d[2]+(d[1]*mu).toFixed(2); }
 function renderEq(){ $("#eqRows").innerHTML=EQ.map(([p,b,s])=>`<div class="ind"><span style="width:32px">${p}</span>
    <input type="range" min="0.25" max="3" step="0.05" value="${MULT[p]||1}" data-p="${p}">
@@ -287,16 +291,18 @@ function renderEq(){ $("#eqRows").innerHTML=EQ.map(([p,b,s])=>`<div class="ind">
 $("#eqReset").onclick=()=>{ MULT={}; localStorage.ps_mult="{}"; renderEq(); buildPATS(); };
 function patAt(r){ const n=v=>v==null?NaN:v; const m=k=>MULT[k]||1;
   const b=n(r.blink),pc=n(r.pc),yc=n(r.yc),hs=n(r.hand_speed),hfd=n(r.hfd),tf=n(r.tif),hands=n(r.hands),ap=n(r.aperture),me=n(r.menergy),sm=n(r.smile),bd=n(r.browDown),pr=n(r.press);
-  const ck=n(r.cheek),rms=n(r.rms),pz=n(r.pause),sp=r.speech;
-  // пороги P06/P10D/P11/P12/P14 масштабируются ползунком эквалайзера (как в конвейере pipeline.PATTERN_DEFS)
+  const ck=n(r.cheek),oc=n(r.ocu),pz=n(r.pause),sp=r.speech,ps=(r.pspeech===0?0:1);
+  // Пороги повторяют pipeline.PATTERN_DEFS (v5.1): P10D — AU6 = max(cheek, геометрия глаза);
+  // P12 — только yaw (25°, pitch как кивок исключён); P13 — строго флаг речи (без rms-фолбэка);
+  // P14 — пауза 0.5–3 c внутри речевого контекста. Ползунок эквалайзера масштабирует порог.
   return {t:r.t,P01:b>0.6*m("P01"),P02:Math.abs(pc)>0.08*m("P02"),P03:(Math.abs(yc)+Math.abs(pc))>0.03*m("P03"),
    P04:hs>0.03*m("P04"),P05:hs>0.1*m("P05"),P06:((tf>0.5||hfd<(0.8/m("P06")))&&hands>0),P07:hs>0.01*m("P07"),
    P08:ap<(0.8/m("P08")),P09:me>0.02*m("P09"),P10:sm>0.4*m("P10"),
-   P10D:sm>0.35&&ck>(0.15*m("P10D")),
+   P10D:sm>0.35&&Math.max(isNaN(ck)?0:ck,isNaN(oc)?0:oc)>(0.15*m("P10D")),
    P11:(bd>0.3*m("P11")||pr>0.2*m("P11")),
-   P12:(Math.abs(yc)>(0.6108*m("P12"))||Math.abs(pc)>(0.6108*m("P12"))),
-   P13:(sp===1||sp===true)||(!isNaN(rms)&&rms>0.005*m("P13")),
-   P14:pz>=0.5*m("P14")}; }
+   P12:Math.abs(yc)>(0.4363*m("P12")),
+   P13:(sp===1||sp===true),
+   P14:(pz>=0.5*m("P14")&&pz<3.0&&ps===1)}; }
 function buildPATS(){ if(!MET||!SUM) return; PATS=MET.map(patAt);
   const dt=MET.length>1?(MET[MET.length-1].t-MET[0].t)/(MET.length-1):0.08;
   const GAP=Math.max(1,Math.round(0.4/dt)), MIN=Math.max(2,Math.round(0.6/dt));

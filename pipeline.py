@@ -1,4 +1,12 @@
-"""PersonaScope pipeline v4.2 (финальная сборка): MediaPipe + аудио + геометрический P06 + приглушённый неон."""
+"""PersonaScope pipeline v5.1: MediaPipe (лицо/поза/руки) + аудио-просодия + геометрический P06.
+
+Изменения v5.1 (калибровка, см. CALIBRATION и summary["calibration"]):
+  * P10D: AU6 считается как max(cheekRaise, геометрия глаза) — blendshape cheekRaise
+    в mediapipe 1.0.0 на референсных видео равен 0 во всех кадрах, из-за чего паттерн не срабатывал ни разу;
+  * P12: только yaw (pitch исключён — кивок не является отведением взгляда), порог 25° вместо 35°;
+  * P14: пауза учитывается только внутри речевого контекста (0.5-3 c), иначе «паузой» становилась тишина;
+  * metrics.jsonl пишется строгим JSON (NaN/Infinity -> null), а не Python-расширением.
+"""
 from __future__ import annotations
 import json, math, os, subprocess, wave
 from collections import deque
@@ -56,18 +64,27 @@ def _mediapipe_importable():
         return str(e)
 
 
+_MP_GL_OK = False
+
 def ensure_mediapipe_gl():
     """Кросс-платформенная проверка MediaPipe: сначала реальный импорт+инициализация.
+
+    Проверка дорогая (создаёт FaceLandmarker на заглушке), а вызывается и из
+    analyze_video, и из _extract_episodes — поэтому результат кэшируется в процессе.
 
     Если что-то не загрузилось — формируем подсказку под конкретную ОС:
       Linux   -> недостающие OpenGL-библиотеки (libegl1 libgles2 libgl1), автоустановка через run.py;
       Windows -> VC++ Redistributable / переустановка wheels / Python 3.9-3.12;
       macOS   -> переустановка mediapipe.
     """
+    global _MP_GL_OK
+    if _MP_GL_OK:
+        return []
     import platform
     system = platform.system()
     err = _mediapipe_importable()
     if err is None:
+        _MP_GL_OK = True
         return []
     # Импорт/инициализация упала. Разбираем причину по ОС.
     so_needed = ["libEGL.so.1", "libGLESv2.so.2", "libGL.so.1"]
@@ -126,13 +143,67 @@ def _nn(v):
     if v is None: return False
     return not (isinstance(v, float) and math.isnan(v))
 
+def _json_safe(o):
+    """NaN/Infinity -> null: metrics.jsonl должен быть строгим JSON.
+
+    Раньше файл содержал литеральные токены NaN (расширение Python): json.loads их
+    принимает, но jq, JS и любые сторонние парсеры — нет.
+    """
+    if isinstance(o, float): return o if math.isfinite(o) else None
+    if isinstance(o, dict): return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, list): return [_json_safe(v) for v in o]
+    return o
+
+def ocu_from_landmarks(lm) -> float:
+    """AU6 (orbicularis oculi) по геометрии глаза: сжатие вертикального разреза глаза
+    относительно его ширины. Единая реализация для конвейера и psychometrics
+    (FACS AU6, Ekman & Friesen 1978). 0..1, NaN если геометрии нет."""
+    if not isinstance(lm, dict): return float("nan")
+    vals = []
+    for top, bot, out_ in ((lm.get("L"), lm.get("B"), lm.get("O")),
+                           (lm.get("R"), lm.get("b"), lm.get("o"))):
+        if None in (top, bot, out_): continue
+        eye_w = math.dist(top, out_) or 1e-6
+        squeeze = 1.0 - (math.dist(top, bot) / eye_w) / 0.55  # 0.55 — нейтральное отношение высоты к ширине
+        vals.append(max(0.0, min(1.0, squeeze)))
+    return sum(vals) / len(vals) if vals else float("nan")
+
+# ---------------------------------------------------------------------------
+# Калибровка детекторов. Значения замерены на трёх референсных прогонах
+# (data/*/metrics.jsonl: 1153, 1304 и 1153 кадра) — обоснование уезжает в
+# summary["calibration"] каждого видео, чтобы пороги были проверяемы, а не «магическими».
+# ---------------------------------------------------------------------------
+GAZE_AVOIDANCE_YAW_DEG = 25.0   # P12: |yc| больше порога = функциональное отведение взгляда
+GAZE_AVOIDANCE_RAD = math.radians(GAZE_AVOIDANCE_YAW_DEG)
+DUCHENNE_AU6_MIN = 0.15         # P10D: порог AU6 (cheekRaise либо геометрия глаза)
+PAUSE_MIN_SEC = 0.5             # P14: минимальная пауза в речи (Vrij 2008)
+PAUSE_MAX_SEC = 3.0             # P14: дольше — это отсутствие речи, а не пауза внутри неё
+PAUSE_CONTEXT_SEC = 5.0         # P14: сколько секунд после речи пауза ещё считается «в речи»
+BLINK_CLOSE_THR = 0.5           # P01: порог закрытия век
+BLINK_REFRACT_SEC = 0.2         # P01: рефрактерность между морганиями (Doughty 1989)
+
+CALIBRATION = {
+    "p12_gaze_avoidance_yaw_deg": GAZE_AVOIDANCE_YAW_DEG,
+    "p12_note": ("только yaw, pitch исключён (кивок != отведение взгляда). На референсных видео порог 35° "
+                 "давал 0.2-0.5% кадров (0-4 кадра из 1153), порог 25° — 1-2%, т.е. измеримый диапазон."),
+    "p10d_au6_min": DUCHENNE_AU6_MIN,
+    "p10d_note": ("cheekRaise в mediapipe 1.0.0 равен 0.0 во всех кадрах референсных видео "
+                  "(min=p50=p90=p99=max=0), поэтому AU6 = max(cheekRaise, геометрия глаза по точкам 145/159/33 и 374/386/263)."),
+    "p14_window_sec": [PAUSE_MIN_SEC, PAUSE_MAX_SEC],
+    "p14_context_sec": PAUSE_CONTEXT_SEC,
+    "p14_note": ("пауза учитывается только в речевом контексте (речь была не позже "
+                 f"{PAUSE_CONTEXT_SEC} c назад); ранее тишина и видео без речи давали P14 на 46-94% кадров."),
+    "p01_blink_thr": BLINK_CLOSE_THR,
+    "p01_refractory_sec": BLINK_REFRACT_SEC,
+}
+
 # Научно операционализированные паттерны (пороги — из литературы, см. psychometrics.NORM_SOURCES):
 # P01 blink-эпизоды; P02 кивки (ритмический pitch-осцилляторный паттерн); P03 мобильность головы;
 # P04/P05 иллюстративные жесты; P06 самоуспокаивающие касания лица (adaptors, Kaitz 2007 / Vismara 2016);
 # P07 мелкая моторная активность (fidgeting); P08 закрытая позиция кисти; P09 смены позы;
 # P10 улыбка; P10D Duchenne-улыбка (mouthSmile + orbicularis oculi — Ekman & Friesen 1978);
-# P11 напряжение (browDown/mouthPress/lipPress); P12 отведение взгляда (>35° от медианы головы);
-# P13 вокализация (активная речь); P14 пауза >=0.5 c (когнитивная нагрузка, Vrij 2008).
+# P11 напряжение (browDown/mouthPress/lipPress); P12 отведение взгляда по yaw;
+# P13 вокализация (активная речь); P14 пауза в речи (когнитивная нагрузка, Vrij 2008).
 PATTERN_DEFS=[
     ("P01","Моргание",            lambda m: _n(m["blink"])>0.6),
     ("P02","Кивок при слушании",   lambda m: _n(m["pc"])>0.08),
@@ -144,14 +215,14 @@ PATTERN_DEFS=[
     ("P08","Положение рук",        lambda m: _nn(m["aperture"]) and m["aperture"]<0.8),
     ("P09","Смена позы",           lambda m: _n(m["menergy"])>0.02),
     ("P10","Подъём уголков губ",   lambda m: _n(m["smile"])>0.4),
-    ("P10D","Duchenne-улыбка",     lambda m: _n(m["smile"])>0.35 and _n(m["cheek"])>0.15),
+    ("P10D","Duchenne-улыбка",     lambda m: _n(m["smile"])>0.35 and max(_n(m.get("cheek")), _n(m.get("ocu")))>DUCHENNE_AU6_MIN),
     ("P11","Брови / напряжение губ", lambda m: _n(m["browDown"])>0.3 or _n(m["press"])>0.2),
-    ("P12","Отведение взгляда",    lambda m: _n(m["yc"])>math.radians(35) or _n(m["pc"])>math.radians(35)),
+    ("P12","Отведение взгляда (yaw)", lambda m: abs(_n(m["yc"]))>GAZE_AVOIDANCE_RAD),
     ("P13","Вокализация",          lambda m: bool(m.get("speech"))),
-    ("P14","Пауза в речи ≥0.5 c",  lambda m: _n(m["pause"])>=0.5),
+    ("P14","Пауза в речи ≥0.5 c",  lambda m: PAUSE_MIN_SEC<=_n(m["pause"])<PAUSE_MAX_SEC and _n(m.get("pspeech",1))>=1),
 ]
-PIPELINE_VERSION="5.0-psychometric"
-STATS_CH=["smile","frown","browUp","browDown","eyeWide","blink","jawO","noseW","press","cheek",
+PIPELINE_VERSION="5.1-calibrated"
+STATS_CH=["smile","frown","browUp","browDown","eyeWide","blink","jawO","noseW","press","cheek","ocu",
           "yaw","pitch","yc","pc","hand_speed","aperture","hfd","hfd2","tif","menergy","face_conf","pose_conf",
           "rms","f0","srate","pause"]
 
@@ -273,9 +344,9 @@ def blink_events(records):
     либо никогда не превышает порог 0.6 -> raw-порог даёт вечную активность или 0 событий.
     Здесь: переходы выше порога закрытия век (>=0.5) с рефрактерным интервалом 200 мс
     (физиологическое время закрытия век ~100-150 мс; Doughty 1989). Возвращает индексы кадров-вершин."""
-    thr=0.5
+    thr=BLINK_CLOSE_THR
     dur=(records[-1]["t"]-records[0]["t"]) if len(records)>1 else 0.0
-    refr=max(1,int(round(0.2*len(records)/dur))) if dur>0 else 1
+    refr=max(1,int(round(BLINK_REFRACT_SEC*len(records)/dur))) if dur>0 else 1
     peaks=[]; closed=False; last=-10**9
     for i,r in enumerate(records):
         v=r.get("blink")
@@ -285,6 +356,51 @@ def blink_events(records):
             closed=True; last=i
         elif v<thr*0.5: closed=False
     return peaks
+
+def pattern_stats(records):
+    """Счётчики и события паттернов P01–P14 по кадрам. Единый источник для summary,
+    слепков и тестов (раньше эта логика жила только внутри analyze_video)."""
+    counters={}; events={}
+    blinks=blink_events(records)
+    for pid,_,fn in PATTERN_DEFS:
+        if pid=="P01":
+            counters["P01"]=len(blinks); events["P01"]=len(blinks); continue
+        c=e=0; prev=False
+        for r in records:
+            a=bool(fn(r))
+            if a:
+                c+=1
+                if not prev: e+=1
+            prev=a
+        counters[pid]=c; events[pid]=e
+    return counters, events, blinks
+
+def truth_cues(records, counters, events, stats, audio_sum=None):
+    """Cue-метрики правдивости и legacy-эвристика нагрузки (формула открыта, НЕ вероятность лжи).
+
+    Возвращает (cues, truth_heuristic). Итоговый score в отчёте берётся из
+    psychometrics.truthfulness.score; это значение — совместимость и один из cues.
+    """
+    nf=len(records); dur=(records[-1]["t"]-records[0]["t"]) if nf else 0.0
+    cues={"duration_sec":round(dur,1),
+          "blink_per_min":round(events.get("P01",0)/dur*60,1) if dur>0 else 0,
+          "smile_ratio":round(counters.get("P10",0)/nf,3) if nf else 0,
+          "tension_ratio":round(counters.get("P11",0)/nf,3) if nf else 0,
+          "avoidance_ratio":round(counters.get("P12",0)/nf,3) if nf else 0,
+          "hand_face_ratio":round(counters.get("P06",0)/nf,3) if nf else 0,
+          "hand_activity_ratio":round(counters.get("P07",0)/nf,3) if nf else 0,
+          "head_yaw_std":(stats.get("yc") or {}).get("std") or 0,
+          "head_pitch_std":(stats.get("pc") or {}).get("std") or 0}
+    if audio_sum:
+        cues["speech_ratio"]=audio_sum.get("speech_ratio",0)
+        cues["pause_per_min"]=round((audio_sum.get("pause_intervals_ge05s") or 0)/dur*60,1) if dur>0 else 0
+        cues["speech_rate_syll_per_sec"]=audio_sum.get("speech_rate_syll_per_sec",0)
+        cues["voice_f0_std_hz"]=audio_sum.get("f0_std_hz")
+    score=100.0-max(0,abs(cues["blink_per_min"]-20))*1.0-cues["avoidance_ratio"]*60-cues["tension_ratio"]*40-cues["hand_face_ratio"]*30-min(40,abs(cues["head_yaw_std"]-0.1)*120)
+    if audio_sum:
+        score-=max(0,abs(cues["speech_rate_syll_per_sec"]-4))*3
+        score-=min(20,cues["pause_per_min"]*1.5)
+    return cues, int(max(5,min(95,score)))
 
 def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, width=480, per_pat=0, models_dir=Path("models")):
     eps=[]; n=len(records)
@@ -398,7 +514,6 @@ def _extract_episodes(records, fps_proc, fps_src, video, ep_dir, make_clips, wid
         for i,ln in enumerate(lines):
             cv2.putText(img,ln,(10,hh-bh+lh*(i+1)-2),cv2.FONT_HERSHEY_SIMPLEX,0.42,(0,255,255),1,cv2.LINE_AA)
         return img
-    rec_by_t=None
     for ep in eps:
         cap.set(cv2.CAP_PROP_POS_MSEC, ep["mid"]*1000)
         ok,fr=cap.read()
@@ -515,6 +630,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
     H_dyn=[deque(maxlen=W) for _ in range(2)]; H_head=[deque(maxlen=W) for _ in range(2)]; H_hands=[deque(maxlen=W) for _ in range(2)]
     H_rms=deque(maxlen=W); H_f0=deque(maxlen=W); H_vemo=deque(maxlen=W)
     yaw_hist=[]; pitch_hist=[]; writer=None; real=0; idx=0; records=[]; prev_pose=None; prev_wr=None
+    last_speech_t=-1e9   # P14: время последней речи (пауза считается только в речевом контексте)
     with mp_vision.FaceLandmarker.create_from_options(fo) as fm, \
          mp_vision.PoseLandmarker.create_from_options(po) as pm, \
          mp_vision.HandLandmarker.create_from_options(ho) as hm:
@@ -532,7 +648,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             face_conf=pose_conf=0.0; n_hands=0; emotion="none"
             smile=frown=browUp=browDown=eyeWide=blink=jawO=noseW=press=cheek=np.nan
             yaw=pitch=np.nan; hand_speed=np.nan; aperture=np.nan; hfd=np.nan; menergy=np.nan
-            hfd2=np.nan; face_wn=np.nan; nose2n=None; face_box=None; tif=0.0
+            hfd2=np.nan; face_wn=np.nan; nose2n=None; face_box=None; tif=0.0; ocu=np.nan
             a_rms=a_f0=np.nan; a_speech=0; a_srate=a_pause=np.nan; a_vemo=np.nan
             if audio is not None and idx<len(audio[0]):
                 a_rms=float(audio[0][idx]); a_f0=float(audio[1][idx])
@@ -547,6 +663,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
                          "O":[round(fl[33].x,4),round(fl[33].y,4)],
                          "R":[round(fl[386].x,4),round(fl[386].y,4)],"b":[round(fl[374].x,4),round(fl[374].y,4)],
                          "o":[round(fl[263].x,4),round(fl[263].y,4)]}
+                ocu=ocu_from_landmarks(lm_pack)   # AU6: единая геометрическая оценка (см. P10D)
                 face_conf=float(np.mean([getattr(p,"visibility",1.0) or 1.0 for p in fl]))
                 for pt in fl: cv2.circle(right,(int(pt.x*w),int(pt.y*h)),1,(0,255,0),-1)
                 lm3=np.array([[p.x,p.y,p.z] for p in fl]); ctr=lm3.mean(0); f=lm3[1]-ctr
@@ -615,12 +732,17 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             pc=pitch-pm_ if not math.isnan(pitch) else np.nan
             rec={"t":round(real/fps,3),"face_conf":round(face_conf,3),"pose_conf":round(pose_conf,3),"hands":n_hands,"emotion":emotion,
                  **{k:round(float(v),4) if not (isinstance(v,float) and math.isnan(v)) else None for k,v in
-                    dict(smile=smile,frown=frown,browUp=browUp,browDown=browDown,eyeWide=eyeWide,blink=blink,jawO=jawO,noseW=noseW,press=press,cheek=cheek,
+                    dict(smile=smile,frown=frown,browUp=browUp,browDown=browDown,eyeWide=eyeWide,blink=blink,jawO=jawO,noseW=noseW,press=press,cheek=cheek,ocu=ocu,
                          yaw=yaw,pitch=pitch,yc=yc,pc=pc,hand_speed=hand_speed,aperture=aperture,hfd=hfd,hfd2=hfd2,tif=tif,menergy=menergy,
                          rms=a_rms,f0=a_f0,srate=a_srate,pause=a_pause,voicemo=a_vemo).items()}}
             rec={k:(v if v is not None else float("nan")) for k,v in rec.items()}
+            # P14: пауза «в речи» — если речь была не позже PAUSE_CONTEXT_SEC назад
+            t_now=real/fps
+            if a_speech: last_speech_t=t_now
+            pspeech=1 if (not a_speech and last_speech_t>0 and (t_now-last_speech_t)<=PAUSE_CONTEXT_SEC) else 0
+            rec["pspeech"]=pspeech
             rec["speech"]=a_speech
-            rec["lm"]=lm_pack  # геометрия глаз для AU6 (Duchenne) в psychometrics._ocu
+            rec["lm"]=lm_pack  # геометрия глаз (legacy-совместимость; AU6 уже посчитан в rec["ocu"])
             records.append(rec)
             if make_dashboard:
                 hud=[f"t={real/fps:6.1f}s",f"face={face_conf:.2f} pose={pose_conf:.2f} hands={n_hands}",
@@ -666,20 +788,8 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
     cap.release()
     if writer: writer.release()
     with (out_dir/"metrics.jsonl").open("w",encoding="utf-8") as f:
-        for r in records: f.write(json.dumps(r,ensure_ascii=False)+"\n")
-    counters={}; events={}
-    blinks=blink_events(records)
-    for pid,_,fn in PATTERN_DEFS:
-        if pid=="P01":
-            counters["P01"]=len(blinks); events["P01"]=len(blinks); continue
-        c=e=0; prev=False
-        for r in records:
-            a=bool(fn(r))
-            if a:
-                c+=1
-                if not prev: e+=1
-            prev=a
-        counters[pid]=c; events[pid]=e
+        for r in records: f.write(json.dumps(_json_safe(r),ensure_ascii=False)+"\n")
+    counters, events, blinks = pattern_stats(records)
     stats={}
     for ch in STATS_CH:
         vals=[r[ch] for r in records if isinstance(r.get(ch),(int,float)) and not math.isnan(float(r[ch]))]
@@ -710,24 +820,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
                    "f0_mean_hz":round(float(np.nanmean(f0)),1) if not np.all(np.isnan(f0)) else None,
                    "f0_std_hz":round(float(np.nanstd(f0)),1) if not np.all(np.isnan(f0)) else None,
                    "voicemo_dist":vm}
-    cues={"duration_sec":round(dur,1),
-          "blink_per_min":round(events["P01"]/dur*60,1) if dur>0 else 0,
-          "smile_ratio":round(counters["P10"]/nf,3) if nf else 0,
-          "tension_ratio":round(counters["P11"]/nf,3) if nf else 0,
-          "avoidance_ratio":round(counters["P12"]/nf,3) if nf else 0,
-          "hand_face_ratio":round(counters["P06"]/nf,3) if nf else 0,
-          "hand_activity_ratio":round(counters["P07"]/nf,3) if nf else 0,
-          "head_yaw_std":stats["yc"]["std"] if stats["yc"] else 0,
-          "head_pitch_std":stats["pc"]["std"] if stats["pc"] else 0}
-    if audio_sum:
-        cues["speech_ratio"]=audio_sum["speech_ratio"]
-        cues["pause_per_min"]=round(pause_intervals/dur*60,1) if dur>0 else 0
-        cues["speech_rate_syll_per_sec"]=audio_sum["speech_rate_syll_per_sec"]
-        cues["voice_f0_std_hz"]=audio_sum["f0_std_hz"]
-    score=100.0-max(0,abs(cues["blink_per_min"]-20))*1.0-cues["avoidance_ratio"]*60-cues["tension_ratio"]*40-cues["hand_face_ratio"]*30-min(40,abs(cues["head_yaw_std"]-0.1)*120)
-    if audio_sum:
-        score-=max(0,abs(cues["speech_rate_syll_per_sec"]-4))*3
-        score-=min(20,cues["pause_per_min"]*1.5)
+    cues, truth_score = truth_cues(records, counters, events, stats, audio_sum)
     episodes=_extract_episodes(records, fps_proc, fps, video, ep_dir, make_clips, models_dir=models_dir)
     # ---- детерминированный психометрический слой (LR-агрегация, нормы из литературы) ----
     psych=None
@@ -743,10 +836,13 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             import traceback as _tb
             _tb.print_exc()
             psych=None
-    method={"P06":"v4-final hybrid: (кончик пальца кисти внутри 2D-бокса лица x1.30 ИЛИ 3D-дистанция запястье->центр головы < 0.8 ширин плеч) AND кисть детектирована; без visibility-гейта; телефон у лица отсеивается"}
-    summary={"method":method,"pipeline_version":PIPELINE_VERSION,"video":Path(video).name,"fps":fps,"n_frames":nf,"duration_sec":round(dur,1),
+    method={"P06":"v4-final hybrid: (кончик пальца кисти внутри 2D-бокса лица x1.30 ИЛИ 3D-дистанция запястье->центр головы < 0.8 ширин плеч) AND кисть детектирована; без visibility-гейта; телефон у лица отсеивается",
+            "P12":f"|yc| > {GAZE_AVOIDANCE_YAW_DEG:g}° от медианы видео (только yaw; pitch как кивок не учитывается)",
+            "P14":f"пауза {PAUSE_MIN_SEC:g}-{PAUSE_MAX_SEC:g} c внутри речи (речь была не позже {PAUSE_CONTEXT_SEC:g} c назад)",
+            "P10D":f"smile>0.35 и AU6 = max(cheekRaise, геометрия глаза) > {DUCHENNE_AU6_MIN:g}"}
+    summary={"method":method,"calibration":CALIBRATION,"pipeline_version":PIPELINE_VERSION,"video":Path(video).name,"fps":fps,"n_frames":nf,"duration_sec":round(dur,1),
              "counters":counters,"events":events,"stats":stats,"emotions":emo_dist,
-             "audio":audio_sum,"truth_cues":cues,"truth_heuristic":int(max(5,min(95,score))),
+             "audio":audio_sum,"truth_cues":cues,"truth_heuristic":truth_score,
              "episodes":episodes,"pattern_names":{pid:nm for pid,nm,_ in PATTERN_DEFS},
              "personality":psych}
     (out_dir/"summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=1),encoding="utf-8")

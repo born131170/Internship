@@ -41,17 +41,58 @@ DEFAULT_USER_PROMPT=(
 )
 
 HEUR_DEF=(
-    "truth_heuristic = clamp(5..95, 100 - |blink_per_min-20|*1 - avoidance_ratio*60 - tension_ratio*40 - "
-    "hand_face_ratio*30 - min(40,|head_yaw_std-0.1|*120) - max(0,|speech_rate_syll_per_sec-4|*3) - min(20,pause_per_min*1.5)). "
+    "truth_heuristic (legacy-формула конвейера) = clamp(5..95, 100 - |blink_per_min-20|*1 - avoidance_ratio*60 - "
+    "tension_ratio*40 - hand_face_ratio*30 - min(40,|head_yaw_std-0.1|*120) - "
+    "max(0,|speech_rate_syll_per_sec-4|*3) - min(20,pause_per_min*1.5)). "
+    "ВАЖНО: итоговый score правдивости берётся не отсюда, а из psychometrics.truthfulness.score "
+    "(валидированные маркеры нагрузки/арузала, поле psychometrics в evidence) — числа для ответа копируются из scores_block. "
     "Это невалидированный невербальный приор утечки/нагрузки, НЕ вероятность лжи; использовать только как один из cues."
 )
 
+_ENV_KEYS={"base_url":"LLM_BASE_URL","api_key":"LLM_API_KEY","model":"LLM_MODEL",
+           "temperature":"LLM_TEMPERATURE","timeout":"LLM_TIMEOUT"}
+
+def _dotenv(path: Path) -> dict:
+    """Минимальный парсер .env-файла (без внешних зависимостей): KEY=VALUE, # — комментарий."""
+    out={}
+    try:
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line=line.strip()
+            if not line or line.startswith("#") or "=" not in line: continue
+            k,v=line.split("=",1)
+            k=k.strip(); v=v.strip().strip('"').strip("'")
+            if k and v: out[k]=v
+    except Exception:
+        pass
+    return out
+
 def load_config(data_dir: Path):
+    """Приоритет источников: переменные окружения > .env.local > data/llm_config.json.
+
+    data/llm_config.json пишет интерфейс; .env.local (в корне проекта или в рабочем каталоге)
+    и переменные окружения позволяют держать ключ вне рабочей папки — .env.local в .gitignore.
+    """
+    cfg={"base_url":"https://sharelim.net/v1","api_key":"","model":"gpt-6-astra","temperature":0.3}
     p=Path(data_dir)/"llm_config.json"
     if p.exists():
-        try: return json.loads(p.read_text(encoding="utf-8"))
+        try:
+            loaded=json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded,dict): cfg.update(loaded)
         except Exception: pass
-    return {"base_url":"https://sharelim.net/v1","api_key":"","model":"gpt-6-astra","temperature":0.3}
+    env={}
+    for root in (Path(__file__).resolve().parent, Path.cwd()):
+        f=root/".env.local"
+        if f.exists():
+            env=_dotenv(f); break
+    for key,envname in _ENV_KEYS.items():
+        val=os.environ.get(envname) or env.get(envname)
+        if val in (None,""): continue
+        if key in ("temperature","timeout"):
+            try: cfg[key]=float(val)
+            except (TypeError,ValueError): continue
+        else:
+            cfg[key]=val
+    return cfg
 
 def compute_confidence(parsed, warnings) -> float:
     """Честный индикатор полноты LLM-ответа 0..1 (не уверенность модели!)."""
@@ -178,6 +219,26 @@ def parse_json(text):
             if fixed is not None: return fixed
     return None
 
+def _cue_list(cues) -> list:
+    """Нормализует поле cues к списку.
+
+    Модель иногда возвращает здесь СТРОКУ вместо массива — тогда прежний код
+    (`for c in (t.get("cues") or [])`) разбирал её по символам, и в интерфейсе
+    вердикт печатался по букве на строку. Список из одиночных символов (след
+    того же бага, уже сохранённый в llm_result.json) склеивается обратно —
+    поэтому старые анализы чинятся без повторного запроса к модели.
+    """
+    if isinstance(cues, str):
+        return [cues] if cues.strip() else []
+    if not isinstance(cues, (list, tuple)):
+        return []
+    items = list(cues)
+    if len(items) >= 3 and all(isinstance(c, str) and len(c) <= 1 for c in items):
+        joined = "".join(items).strip()
+        return [joined] if joined else []
+    return items
+
+
 def validate_result(parsed: dict, summary: dict):
     warn=[]
     if not isinstance(parsed,dict): return None,["Ответ модели не является JSON-объектом"]
@@ -217,7 +278,7 @@ def validate_result(parsed: dict, summary: dict):
         # нормализация cues ДО детерминированной подстановки: модель может вернуть
         # строки вместо объектов {"cue","direction"} — фронт печатал «undefined ()»
         nc=[]
-        for c in (tt.get("cues") or []):
+        for c in _cue_list(tt.get("cues")):
             if isinstance(c,dict):
                 nm=str(c.get("cue") or c.get("name") or c.get("marker") or "").strip()
                 dr=str(c.get("direction") or c.get("note") or "").strip()
@@ -234,7 +295,8 @@ def validate_result(parsed: dict, summary: dict):
             dscore=dt.get("score")
             if isinstance(dscore,(int,float)):
                 if isinstance(tt.get("score"),(int,float)) and abs(float(tt["score"])-float(dscore))>2:
-                    warn.append(f"truthfulness.score={tt['score']} заменён детерминированным значением движка {dscore} (LLM не меняет числа)")
+                    warn.append(f"truthfulness.score={tt['score']} заменён детерминированным значением движка {dscore} "
+                                f"(источник: {dt.get('source','уточняется')}; LLM не меняет числа)")
                 tt["score"]=dscore
                 if not (tt.get("verdict") or "").strip():
                     tt["verdict"]=dt.get("verdict","")

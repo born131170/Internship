@@ -10,6 +10,13 @@ SNAP_VERSION="5.0"
 DEFAULT_CHANNELS=["hand_speed","aperture","hfd","hfd2","yc","pc","menergy"]
 N=64
 MAX_EXT=1.5
+# Максимальное превышение длительности кандидата над длительностью слепка. Длинные
+# интервалы «вездесущих» паттернов (P03 движения головы активен 30-60% кадров, P07 —
+# почти всегда) раньше уходили в ответ целиком: «00:17-01:10» = 53 c при слепке 3 c,
+# и такое окно совпадало по форме случайно, потому что обе кривые сжимаются к N=64.
+MAX_DUR_RATIO=2.0
+SPLICE_STEP_SEC=0.5
+SPLICE_MAX_SPANS=60
 
 # Единый источник определений паттернов — pipeline.PATTERN_DEFS
 # (научно операционализированные пороги, Ekman/FACS, Kaitz 2007, Vismara 2016 и др.).
@@ -249,6 +256,34 @@ def _spans_by_activity(records,mask,chans,fps_proc,dur_s,min_frac=0.15,max_mult=
             uniq.append((start,start+W-1))
     return uniq[:800]
 
+def _explode_span(records,mask,chans,fps_proc,a,b,dur_s,max_ratio=MAX_DUR_RATIO):
+    """Режет длинный интервал паттерна на кандидатов длиной ~dur_s (окно слепка).
+
+    Сначала — тот же сплайсинг по локальной активности, что и в free-режиме
+    (_spans_by_activity), затем страховка ровной сеткой с шагом SPLICE_STEP_SEC.
+    Благодаря этому 3-секундный слепок жеста «рука-лицо» даёт конкретные короткие
+    эпизоды, а не одно окно на всю минуту.
+    """
+    dur_c=records[b]["t"]-records[a]["t"]
+    if dur_c<=max_ratio*dur_s: return [(a,b)]
+    sub=records[a:b+1]; sub_mask=mask[a:b+1]
+    out=[]
+    try:
+        for x,y in _spans_by_activity(sub,sub_mask,chans,fps_proc,dur_s):
+            if records[a+y]["t"]-records[a+x]["t"]<=max_ratio*dur_s: out.append((a+x,a+y))
+    except Exception:
+        out=[]
+    if not out:
+        W=max(3,int(round(dur_s*fps_proc))); step=max(1,int(round(SPLICE_STEP_SEC*fps_proc)))
+        starts=list(range(0,max(1,(b-a+1)-W+1),step))
+        out=[(a+s,min(b,a+s+W-1)) for s in starts] or [(a,min(b,a+W-1))]
+    out=sorted(set(out))
+    if len(out)>SPLICE_MAX_SPANS:
+        k=max(1,len(out)//SPLICE_MAX_SPANS)
+        out=out[::k][:SPLICE_MAX_SPANS]
+    return out
+
+
 def _morph_ok(win,S_c,dur_s,fps_proc):
     """Морфологическая проверка формы кривой окна против слепка (аффинно-инвариантно)."""
     v=np.asarray([x for x in win if not _isnan(x)],dtype=float)
@@ -356,7 +391,13 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
             # face_touch: касание лица (P06) имеет наивысший приоритет семантики запроса
             ft=[x for x in present if PAT_DEFS[x][0]=="P06"]
             if face_touch and ft: active=[ft[0]]
-            else: active=[max(present,key=lambda x:(frac[x],-x))]
+            else:
+                # Специфичность вместо «самой большой доли в окне»: P03 и P07 активны почти
+                # во всех кадрах, поэтому по доле они всегда обыгрывали P06/P04 — и слепок
+                # жеста «рука-лицо» искался по движениям головы. Берём паттерн, наиболее
+                # перепредставленный в окне слепка относительно всего видео (lift).
+                vfrac={x:float(np.mean((mask>>x)&1==1)) for x in present}
+                active=[max(present,key=lambda x:((frac[x]+0.02)/(vfrac.get(x,0.0)+0.02),frac[x],-x))]
         elif not strict_ft:
             active=[max(active,key=lambda x:(frac[x],-x))]
         # strict_ft + нет P06-эпизодов в видео: active остаётся = [P06] -> eps=[],
@@ -397,11 +438,17 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
             starts=list(range(0,max(1,len(records)-W+1),step)) or [0]
             spans=[(s,min(len(records)-1,s+W-1)) for s in starts]
     else:
-        spans=[tuple(e) for e in eps]
+        # Длинные интервалы паттернов режем на окна длиной со слепок: иначе кандидат
+        # «00:17-01:10» (53 c) обыгрывал реальные короткие эпизоды жеста.
+        spans=[]
+        for a_,b_ in (tuple(e) for e in eps):
+            spans.extend(_explode_span(records,mask,chans,fps_proc,a_,b_,dur_s))
+        if not spans: spans=[tuple(e) for e in eps]
     for k,(a,bb) in enumerate(spans):
         win=records[a:bb+1]
         dur_c=T[bb]-T[a]
         if dur_c<=0: continue
+        if dur_c>MAX_DUR_RATIO*dur_s: continue   # окно на всё видео не может быть совпадением слепка
         # face_touch: хотя бы в 25% кадров окна реально детектирована кисть у лица
         if face_touch:
             ntouch=sum(1 for r in win if _face_touch_gate(r))
@@ -432,7 +479,7 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
     meta={"total":len(cands),"returned":len(keep),"version":SNAP_VERSION,"pattern":pid,
           "mode":mode,"episodes_of_pattern":len(eps),
           "patterns_in_snapshot":[PAT_DEFS[x][0] for x in range(len(PAT_DEFS)) if req&(1<<x)],
-          "channels":chans,"snapshot_duration":dur_s,
+          "channels":chans,"snapshot_duration":dur_s,"max_dur_ratio":MAX_DUR_RATIO,
           "face_touch_gate":bool(face_touch),"strict_face_touch":bool(strict_ft),
           "snapshot_touch_frac":round(float(frac_touch),2)}
     if meta_note: meta["note"]=meta_note

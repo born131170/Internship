@@ -1,16 +1,23 @@
 from __future__ import annotations
-import json, shutil, subprocess, threading, time, traceback, uuid
+import json, math, os, shutil, subprocess, threading, time, traceback, uuid
 from pathlib import Path
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 import pipeline, snapshots, llm
 import scoring
 
-DATA=Path("data"); SNAP=DATA/"snapshots"; STATIC=Path(__file__).parent/"static"
-DATA.mkdir(exist_ok=True); SNAP.mkdir(parents=True, exist_ok=True)
+# Каталог данных можно переопределить (тесты, несколько профилей): PERSONASCOPE_DATA=<путь>.
+DATA=Path(os.environ.get("PERSONASCOPE_DATA") or "data")
+SNAP=DATA/"snapshots"; STATIC=Path(__file__).parent/"static"
+DATA.mkdir(parents=True, exist_ok=True); SNAP.mkdir(parents=True, exist_ok=True)
 JOBS: dict = {}
 LLM_JOBS: dict = {}
-app=FastAPI(title="PersonaScope")
+app=FastAPI(title="PersonaScope", version=pipeline.PIPELINE_VERSION)
+
+def _is_local(request: Request) -> bool:
+    """Запрос пришёл с этой же машины (loopback) — только тогда отдаём секреты наружу."""
+    host=(request.client.host if request.client else "") or ""
+    return host in ("127.0.0.1","::1","localhost","testclient")
 
 @app.middleware("http")
 async def _nocache(request, call_next):
@@ -18,6 +25,12 @@ async def _nocache(request, call_next):
     if request.url.path=="/" or request.url.path.startswith("/api/"):
         resp.headers["Cache-Control"]="no-store, must-revalidate"
     return resp
+
+def _snap_dir() -> Path:
+    """Каталог слепков: создаётся при импорте, но если его удалили (очистка данных,
+    смена PERSONASCOPE_DATA) — восстанавливаем, иначе запись падала в FileNotFoundError."""
+    SNAP.mkdir(parents=True, exist_ok=True)
+    return SNAP
 
 def _vdir(vid: str) -> Path:
     d=DATA/vid
@@ -30,7 +43,9 @@ def _metrics(d: Path):
     return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
 
 def _clean(o):
-    if isinstance(o,float): return None if o!=o else o
+    # NaN/Infinity -> null: ответы API должны быть строгим JSON (в файлах старых прогонов
+    # metrics.jsonl встречаются литеральные NaN — их отдаём как null)
+    if isinstance(o,float): return o if math.isfinite(o) else None
     if isinstance(o,dict): return {k:_clean(v) for k,v in o.items()}
     if isinstance(o,list): return [_clean(v) for v in o]
     return o
@@ -58,14 +73,23 @@ def _transcode(d: Path, which="dashboard"):
     except Exception:
         traceback.print_exc(); return False
 
-def _register(vid: str):
-    reg=DATA/"index.json"; items=[]
+def _read_registry():
+    """Реестр готовых анализов. Записи без каталога/без summary.json отбрасываются:
+    раньше index.json копил идентификаторы удалённых прогонов (44 из 47), и
+    «Открыть последний анализ» мог вести в никуда."""
+    reg=DATA/"index.json"
+    items=[]
     if reg.exists():
-        try: items=json.loads(reg.read_text(encoding="utf-8"))
+        try:
+            loaded=json.loads(reg.read_text(encoding="utf-8"))
+            if isinstance(loaded,list): items=[x for x in loaded if isinstance(x,dict)]
         except Exception: items=[]
-    items=[x for x in items if x.get("id")!=vid]
+    return [x for x in items if isinstance(x.get("id"),str) and (DATA/x["id"]/"summary.json").exists()]
+
+def _register(vid: str):
+    items=[x for x in _read_registry() if x.get("id")!=vid]
     items.append({"id":vid,"finished":time.time()})
-    reg.write_text(json.dumps(items,ensure_ascii=False),encoding="utf-8")
+    (DATA/"index.json").write_text(json.dumps(items,ensure_ascii=False),encoding="utf-8")
 
 @app.get("/")
 def index(): return FileResponse(STATIC/"index.html")
@@ -98,12 +122,10 @@ def job(vid: str): return JOBS.get(vid,{"state":"idle","progress":0.0,"msg":""})
 
 @app.get("/api/videos/latest")
 def latest():
-    reg=DATA/"index.json"
-    if reg.exists():
-        try:
-            items=json.loads(reg.read_text(encoding="utf-8"))
-            if items: return {"id":items[-1]["id"],"finished":items[-1].get("finished")}
-        except Exception: pass
+    items=_read_registry()
+    if items:
+        items.sort(key=lambda x: x.get("finished") or 0)
+        return {"id":items[-1]["id"],"finished":items[-1].get("finished")}
     cands=[((p/"summary.json").stat().st_mtime,p) for p in DATA.glob("*") if (p/"summary.json").exists()]
     if not cands: return {"id":None}
     cands.sort(); return {"id":cands[-1][1].name}
@@ -136,7 +158,7 @@ def truth(vid: str):
         t=(lr.get("parsed") or {}).get("truthfulness")
         if isinstance(t,dict):
             cues=[]
-            for c in (t.get("cues") or []):
+            for c in llm._cue_list(t.get("cues")):
                 # нормализация: модель может вернуть строки вместо объектов —
                 # иначе фронтенд печатает «undefined ()» на каждом пункте
                 if isinstance(c,dict):
@@ -158,7 +180,9 @@ def truth(vid: str):
 @app.get("/api/videos/{vid}/file")
 def vfile(vid: str, path: str):
     base=_vdir(vid).resolve(); fp=(base/path).resolve()
-    if not str(fp).startswith(str(base)): raise HTTPException(403)
+    # is_relative_to вместо startswith: строковое сравнение пропускало соседний каталог
+    # с именем-префиксом (…/data/<vid>XYZ проходил проверку для …/data/<vid>).
+    if fp!=base and not fp.is_relative_to(base): raise HTTPException(403)
     if not fp.exists():
         if fp.name in ("dashboard_web.mp4","source_web.mp4"):
             w="dashboard" if fp.name.startswith("dashboard") else "source"
@@ -178,7 +202,7 @@ def create_snap(vid: str, payload: dict):
         snap=snapshots.create_snapshot(recs,t0,t1,
             payload.get("channels") or snapshots.DEFAULT_CHANNELS, payload.get("name") or "слепок")
         snap["source_video"]=vid
-        (SNAP/f"{snap['id']}.json").write_text(json.dumps(_clean(snap),ensure_ascii=False),encoding="utf-8")
+        (_snap_dir()/f"{snap['id']}.json").write_text(json.dumps(_clean(snap),ensure_ascii=False),encoding="utf-8")
         return _clean(snap)
     except ValueError as e:
         return JSONResponse(status_code=422,content={"error":f"Некорректное окно слепка: {e}"})
@@ -222,7 +246,7 @@ async def upload_snap(file: UploadFile=File(...)):
         return JSONResponse(status_code=422,content={"error":f"каналы не-списки: {bad}"})
     data.setdefault("id",uuid.uuid4().hex[:10]); data["id"]=str(data["id"])[:40]
     data["name"]=str(data.get("name","слепок"))[:80]
-    (SNAP/f"{data['id']}.json").write_text(json.dumps(data,ensure_ascii=False),encoding="utf-8")
+    (_snap_dir()/f"{data['id']}.json").write_text(json.dumps(data,ensure_ascii=False),encoding="utf-8")
     return {"id":data["id"],"name":data["name"],"channels":list(data["series"].keys())}
 
 @app.post("/api/videos/{vid}/search")
@@ -243,10 +267,20 @@ def search(vid: str, payload: dict):
         return JSONResponse(status_code=502,content={"error":f"Ошибка поиска: {llm.describe_error(e)}"})
 
 @app.get("/api/llm/config")
-def get_cfg(): return llm.load_config(DATA)
+def get_cfg(request: Request):
+    """Настройки LLM. Ключ отдаём только запросам с этой же машины: если сервер поднят
+    на 0.0.0.0 (HOST=0.0.0.0), клиент из локальной сети получит конфиг без ключа."""
+    cfg=llm.load_config(DATA)
+    out=dict(cfg)
+    out["key_set"]=bool(cfg.get("api_key"))
+    if not _is_local(request): out["api_key"]=""
+    return out
 
 @app.put("/api/llm/config")
-def put_cfg(payload: dict): llm.save_config(DATA,payload); return payload
+def put_cfg(payload: dict, request: Request):
+    if not _is_local(request):
+        raise HTTPException(403,"настройки LLM можно менять только с локальной машины")
+    llm.save_config(DATA,payload); return payload
 
 @app.get("/api/llm/status")
 def llm_status():
@@ -337,7 +371,7 @@ def llm_analyze(vid: str, payload: dict = None):
                             tv=(sc or {}).get("verdict") if isinstance(sc,dict) else None
                             t["verdict"]=tv or f"Детерминированная эвристика: {(sc or {}).get('score','—')}/100 — невербальный приор нагрузки/утечки (не вероятность лжи)"
                         nc=[]
-                        for c in (t.get("cues") or []):
+                        for c in llm._cue_list(t.get("cues")):
                             if isinstance(c,dict):
                                 nm=str(c.get("cue") or c.get("name") or c.get("marker") or "").strip()
                                 dr=str(c.get("direction") or c.get("note") or "").strip()

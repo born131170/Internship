@@ -1,2 +1,35 @@
+# --- секреты: ключи LLM НИКОГДА не коммитятся ---
+.env
+.env.*
+!.env.example
+*llm_config.json
+
+# --- результаты прогонов: видео людей, кадры, метрики, отчёты ---
+data/
+data_test/
+Downloads/
+*.mp4
+*.mov
+*.webm
+*.wav
+*.jsonl
+*.pptx
+
+# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+tests/_tmp/
+tests/_tmp_engine/
+
+# --- прочее ---
+*.zip
+*.tar.gz
+*.bak
+*.bak_before_fix
+Thumbs.db
+.DS_Store

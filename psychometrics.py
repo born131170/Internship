@@ -34,23 +34,29 @@
 """
 from __future__ import annotations
 import math
-from statistics import NormalDist
 
-_ND = NormalDist()
+# Единый источник порогов и формул с конвейером: не дублируем константы, иначе слои
+# расходятся (именно так «cheekRaise» в этом модуле разошёлся с каналом «cheek» в pipeline).
+try:
+    from pipeline import GAZE_AVOIDANCE_YAW_DEG as _GAZE_DEG, ocu_from_landmarks as _ocu_geom
+except Exception:  # автономный режим без cv2/pipeline — значения по умолчанию совпадают с pipeline
+    _GAZE_DEG = 25.0
+    _ocu_geom = None
 
 # ----------------------------------------------------------------------------
 # 1. Операционализации (что именно и как считаем из кадровых записей)
 # ----------------------------------------------------------------------------
 OPERATIONS = {
     "blink_rate_bpm": "eyeBlink blendshape > 0.5, склейка событий с гистерезисом (возврат < 0.25), частота per minute",
-    "smile_duchenne_ratio": "доля времени с одновременными mouthSmile>0.35 И orbicularis oculi (cheekRaise/eyeSquint)>0.15 — Duchenne-маркер (Ekman & Friesen 1978)",
+    "smile_duchenne_ratio": "доля времени с mouthSmile>0.35 и AU6>0.15, где AU6 = max(cheekRaise blendshape, геометрия глаза: сжатие вертикального разреза относительно ширины) — Duchenne-маркер (Ekman & Friesen 1978). В mediapipe 1.0.0 cheekRaise на референсных видео = 0 во всех кадрах, поэтому решает геометрический AU6",
+    "au6_geometry": "ocu = 1 - (высота_глаза / ширина_глаза) / 0.55 по точкам 145/159/33 (левый) и 374/386/263 (правый), clip 0..1; считается один раз в pipeline.ocu_from_landmarks и пишется в канал rec['ocu']",
     "positive_neg_affect": "VAL = mean(smile + cheekRaise) - mean(frown + browDown + press); ARO = mean(jawOpen + eyeWide + rms_z) (Russell circumplex)",
     "gesture_rate_per_min": "пики hand_speed (запястье, нормир. к длине предплечья) > 0.05/кадр, рефрактер 0.3 c — адаптивные жесты (McNeill 1992)",
     "illustrized_gesture_amp": "медиана амплитуды hand_speed во время речи (speech==1)",
     "self_touch_rate_per_min": "события tif/hfd2<1.2 (кончик пальца в боксе лица или у носа) — иллюстраторы-адапторы, эмблемы исключеныSpeech-gesture overlap",
     "postural_shift_rate": "menergy > p90 собственного распределения, событий/мин — кинетизм (Schafer et al. экспрессивность движения)",
     "head_mobility": "std(yaw)+std(pitch) от медианной базы — мобильность головы (Weckx et al. 1999: выше у экстравертов)",
-    "gaze_avoidance_ratio": "доля времени |yaw| > 35° от медианы (проксимальный критерий отведения взгляда; NOT lie cue)",
+    "gaze_avoidance_ratio": "доля времени |yaw - медиана| > GAZE_AVOIDANCE_YAW_DEG (25°) — проксимальный критерий отведения взгляда (НЕ lie-cue). Раньше порог был 35°, что давало 0-0.5% кадров",
     "vocal_pitch_mean_std": " autocorrelation F0 70–400 Гц: mean/std по озвонченным окнам (praat-эквивалент)",
     "speech_rate_syll_est": "пики RMS-огибающей ≥ локального порога, слоги/сек речи (Ramus, Mehl & IVANCIC 2003: ~4.2 сл./с средний темп)",
     "pause_stats": "паузы ≥ 0.5 c внутри речи: число/мин и средняя длительность (fluency; Goldberg 2006)",
@@ -154,7 +160,7 @@ def extract_behavior(records):
     def ch(name, recs=None):
         return [_num(r, name) for r in (recs if recs is not None else face_ok)]
 
-    smile = ch("smile"); cheek = ch("cheekRaise"); frown = ch("frown")
+    smile = ch("smile"); cheek = ch("cheek"); frown = ch("frown")
     browdown = ch("browDown"); press = ch("press"); jawo = ch("jawO")
     eyewide = ch("eyeWide"); blink = ch("blink")
     yaw = ch("yaw"); pitch = ch("pitch")
@@ -172,27 +178,23 @@ def extract_behavior(records):
                 inb = False
     blink_rate = blinks / minutes if minutes > 0 else None
 
-    # Duchenne-улыбка: smile + orbicularis oculi. blendshape cheekRaise у MediaPipe часто =0,
-    # поэтому OCU-компонента считается по якорям 468-landmark (внешний угол глаза vs нижнее веко),
-    # нормированной на ширину глаза — AU6 "Cheek Raiser" (Ekman & Friesen 1978; PCA-подход).
+    # Duchenne-улыбка: smile + orbicularis oculi (AU6). blendshape cheekRaise в mediapipe 1.0.0
+    # на референсных видео равен 0 во всех кадрах, поэтому AU6 берётся как max(cheek, ocu),
+    # где ocu — геометрия глаза (точки 145/159/33 и 374/386/263), посчитанная в pipeline
+    # функцией ocu_from_landmarks (Ekman & Friesen 1978, FACS AU6). Формула здесь не дублируется.
     def _ocu(r):
-        """Прищуривание/подъём щеки из геометрии глаз: сжатие вертикального разреза глаза."""
+        """AU6 кадра: готовый канал rec["ocu"]; для старых metrics.jsonl — та же геометрия."""
+        v = _num(r, "ocu")
+        if v is not None:
+            return v
+        if _ocu_geom is None:
+            return None
+        lm = r.get("lm") if isinstance(r.get("lm"), dict) else None
         try:
-            lm = r.get("lm") if isinstance(r.get("lm"), dict) else None
-            if not lm:
-                return None
-            l_top, l_bot, l_out = lm.get("L"), lm.get("B"), lm.get("O")
-            r_top, r_bot, r_out = lm.get("R"), lm.get("b"), lm.get("o")
-            vals = []
-            for top, bot, out_ in ((l_top, l_bot, l_out), (r_top, r_bot, r_out)):
-                if None in (top, bot, out_):
-                    continue
-                eye_w = math.dist(top, out_) or 1e-6
-                squeeze = 1.0 - (math.dist(top, bot) / eye_w) / 0.55  # 0.55 — нейтральное соотношение высоты/ширины
-                vals.append(_clip(squeeze, 0, 1))
-            return sum(vals) / len(vals) if vals else None
+            g = _ocu_geom(lm)
         except Exception:
             return None
+        return None if g is None or (isinstance(g, float) and math.isnan(g)) else g
 
     duch_frames = pos_frames = neg_frames = 0
     ocu_series = [_ocu(r) for r in face_ok]
@@ -221,13 +223,14 @@ def extract_behavior(records):
     arousal_mix = _mean([_std(jawo) or 0, _std(eyewide) or 0])
     expr_intensity = _std([x for xs in (smile, frown, browdown, jawo, eyewide, press) for x in xs if x is not None])
 
-    # gaze avoidance: |yaw - median| > rad(35)
+    # gaze avoidance: доля времени, когда |yaw - медиана| превышает порог конвейера
+    # (pipeline.GAZE_AVOIDANCE_YAW_DEG, по умолчанию 25°)
     ymed = _p(yaw, 0.5)
     avoid_ratio = None
     if ymed is not None:
         ys = [y for y in yaw if y is not None]
         if ys:
-            avoid_ratio = sum(1 for y in ys if abs(y - ymed) > math.radians(35)) / len(ys)
+            avoid_ratio = sum(1 for y in ys if abs(y - ymed) > math.radians(_GAZE_DEG)) / len(ys)
     head_yaw_std = _std([y - ymed for y in yaw if y is not None]) if ymed is not None else None
     head_pitch_std = _std([p for p in pitch if p is not None])
 
@@ -238,12 +241,12 @@ def extract_behavior(records):
     gest_events = refractory_peaks(hs, [r["t"] for r in records], thr, 0.3)
     gesture_rate = gest_events / minutes if minutes > 0 else None
 
+    # самокасания: только эпизоды-события по tif с рефрактерностью 0.5 c.
+    # Раньше здесь было второе присваивание поверх вычисления через hfd2 — оно затирало
+    # результат, т.е. мёртвая ветка; оставлено одно консервативное определение.
     st_events = refractory_peaks([_num(r, "tif") or 0 for r in records],
                                  [r["t"] for r in records], 0.5, 0.5)
-    hfd2 = [_num(r, "hfd2") for r in records]
-    st_near = sum(1 for v in hfd2 if v is not None and v < 1.2)
-    self_touch_rate = max(st_events, st_near / max(dt, 1e-6) / 60.0 * dt) / minutes if minutes > 0 else None
-    self_touch_rate = st_events / minutes if minutes > 0 else None  # консервативно: только эпизоды-события
+    self_touch_rate = st_events / minutes if minutes > 0 else None
 
     me = [_num(r, "menergy") for r in records]
     mev = [v for v in me if v is not None]
@@ -269,7 +272,7 @@ def extract_behavior(records):
     if f0_std and srms:
         mE, sE = _mean(srms), _std(srms)
         if sE:
-            vocal_var = _clip(f0_std / 25.0, 0, 2) + _clip((max(srms) and sE / (mE or 1e-9)) / 1.2, 0, 2)
+            vocal_var = _clip(f0_std / 25.0, 0, 2) + _clip((sE / (mE or 1e-9)) / 1.2, 0, 2)
     syl_rate = _mean([_num(r, "srate") for r in records if r.get("speech")])
     pauses_ge5 = [p for p in pause if p is not None and p >= 0.5]
     pause_per_min = len(pauses_ge5) / minutes if minutes > 0 else None
@@ -345,15 +348,15 @@ TIER_W = {"strong": 1.0, "moderate": 0.6, "weak": 0.3}
 
 
 def _lr(v, lo, hi):
-    """Сигмоидальный LR: значение v сравнивается с «низким» lo и «высоким» hi диапазонами."""
+    """LR «высокая черта vs низкая черта»: отношение двух гауссовых плотностей с центрами
+    в hi и lo и полушириной диапазона. v=None -> None (индикатор недоступен).
+    Считается в логарифмах: прямая формула теряла знак на больших |v| (обе плотности
+    уходили в 0 и clip возвращал 1/8 там, где черта выражена максимально)."""
     if v is None:
         return None
-    zl = _ND.cdf((v - lo) / (abs(hi - lo) / 2 + 1e-9))
-    zh = _ND.cdf((v - hi) / (abs(hi - lo) / 2 + 1e-9))
-    # отношение правдоподобия high-trait vs low-trait гауссиан
-    num = math.exp(-0.5 * ((v - hi) / (abs(hi - lo) / 2 + 1e-9)) ** 2)
-    den = math.exp(-0.5 * ((v - lo) / (abs(hi - lo) / 2 + 1e-9)) ** 2) + 1e-12
-    return _clip(num / den, 1 / 8, 8)
+    half = abs(hi - lo) / 2 + 1e-9
+    log_lr = -0.5 * (((v - hi) / half) ** 2 - ((v - lo) / half) ** 2)
+    return _clip(math.exp(_clip(log_lr, -20.0, 20.0)), 1 / 8, 8)
 
 
 def _log_lr(v, lo, hi):
@@ -428,6 +431,9 @@ def compute_trait_scores(b):
         agg = sum(zs) / wsum  # нормированный log-LR на индикатор ∈ [-ln8, ln8]
         z = _clip(agg / (math.log(8) * 0.5), -2, 2)
         score = _clip(50 + 15 * z, 5, 95)
+        # CI аналитический: полуширина 1.96*15*se/2, se = 1/sqrt(число независимых индикаторов).
+        # Это НЕ бутстрап по эпизодам (как ошибочно сказано в глоссарии UI) и не интервал
+        # прогноза: он отражает только объём доступных индикаторов.
         se = 1.0 / math.sqrt(max(1, len(zs)))
         ci = (round(_clip(score - 1.96 * 15 * se / 2, 0, 100), 1),
               round(_clip(score + 1.96 * 15 * se / 2, 0, 100), 1))
@@ -444,8 +450,6 @@ def derived_models(bf):
         return (bf.get(t) or {}).get("score")
     E, A, C, N, O = g("extraversion"), g("agreeableness"), g("conscientiousness"), g("neuroticism"), g("openness")
     res = {}
-    if None not in (E, I := None) or True:
-        pass
     axes = {}
     if E is not None and N is not None:
         axes["E_I"] = round(E, 1)

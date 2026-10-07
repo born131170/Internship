@@ -1,7 +1,0 @@
-{
- "base_url": "http://127.0.0.1:8138/v1",
- "api_key": "k",
- "model": "test",
- "temperature": 0.3,
- "system_prompt": "ТЫ — ТЕСТОВЫЙ ЭКСПЕРТ. Отвечай строго JSON."
-}
