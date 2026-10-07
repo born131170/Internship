@@ -53,6 +53,20 @@ def matched(det, gt):
     return out
 
 
+def gt_windows(gt, kind="touch"):
+    """Окна разметки заданного типа: touch (касание), near (рука рядом без касания),
+    negative (заведомо не касание). kind=None — все окна."""
+    out = []
+    for w in gt.get("windows", []):
+        if isinstance(w, (list, tuple)):
+            k, a, b = "touch", float(w[0]), float(w[1])
+        else:
+            k, a, b = w.get("kind", "touch"), float(w["t0"]), float(w["t1"])
+        if kind is None or k == kind:
+            out.append((a, b))
+    return out
+
+
 def run_eval(strict=True, verbose=True, percentile=None, tau=None):
     gt_all = json.loads(GT_PATH.read_text(encoding="utf-8"))
     if tau is not None:
@@ -62,14 +76,14 @@ def run_eval(strict=True, verbose=True, percentile=None, tau=None):
     keys = [k for k in runs if runs[k]["gt_key"] in gt_all]
     results = []
     for src in keys:
-        gt_src = gt_all[runs[src]["gt_key"]]["windows"]
+        gt_src = gt_windows(gt_all[runs[src]["gt_key"]], "touch")
         a, b = gt_src[0]                       # шаблон — из первого размеченного окна источника
         snap = snapshots.create_snapshot(runs[src]["recs"], a, b, CHANNELS, f"gt_{src}")
         snap["source_video"] = src
         if verbose:
             print(f"\n=== шаблон из {runs[src]['gt_key']} ({a}-{b} c) ===")
         for tgt in keys:
-            gt = gt_all[runs[tgt]["gt_key"]]["windows"]
+            gt = gt_windows(gt_all[runs[tgt]["gt_key"]], "touch")
             kw = {"top_k": 100, "target_video": tgt}
             if strict:
                 kw["face_touch"] = True

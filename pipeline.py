@@ -265,6 +265,7 @@ BLINK_REFRACT_SEC = 0.2         # P01: рефрактерность между �
 # внутри окна касания против 6.4% вне него — терял не детектор, а старый AND из трёх порогов.
 TOUCH_MAX_TAU = 1.0      # кисть считается «у лица» (подобрано на разметке владельца, см. CALIBRATION)
 TWRIST_MAX_TAU = 2.6     # фолбэк по запястью позы, когда кисть не найдена
+TWRIST_MIN_VIS = 0.5     # минимальная видимость запястья для фолбэка (иначе Pose «придумывает» точку)
 TOUCH_MIN_SEC = 0.75     # короче — не эпизод касания (при stride=2 это ~3 кадра)
 TOUCH_GAP_SEC = 0.25     # разрыв, который ещё склеивается в один эпизод
 
@@ -283,11 +284,15 @@ CALIBRATION = {
     "p01_refractory_sec": BLINK_REFRACT_SEC,
     "touch_max_tau": TOUCH_MAX_TAU,
     "twrist_max_tau": TWRIST_MAX_TAU,
+    "twrist_min_visibility": TWRIST_MIN_VIS,
     "touch_window_sec": [TOUCH_MIN_SEC, TOUCH_GAP_SEC],
     "touch_note": ("касание = расстояние «кисть -> ближайшая вершина меша лица» <= touch_max_tau в единицах "
                    "межзрачкового расстояния; если кисть не детектирована, фолбэк — запястье позы "
                    "(twrist_max_tau). Раньше требовался hands>0 И два из {tif>0.5, hfd<0.8, hfd2<0.55}, "
-                   "что пропускало 1.13% кадров и давало ноль находок в строгом режиме."),
+                   "что пропускало 1.13% кадров и давало ноль находок в строгом режиме. Фолбэк по запястью "
+                   "считается только при видимости запястья не ниже twrist_min_visibility: иначе Pose "
+                   "подставляет правдоподобную, но неверную точку, и «касание» возникало в кадрах, где "
+                   "ладоней в кадре нет вовсе."),
     "touch_calibration": ("пороги подобраны перебором на разметке (video1: 0-2, 25-28, 74-77 c; video2: "
                           "3.5-7.5, 12.5-15.5, 103-105, 119.5-121.5, 128-129, 132-132.5 c) скриптом "
                           "tools/eval_touch.py --sweep: episode-level precision 0.83, recall 0.67, F1 0.73 "
@@ -321,7 +326,7 @@ PATTERN_DEFS=[
     ("P14","Пауза в речи ≥0.5 c",  lambda m: PAUSE_MIN_SEC<=_n(m["pause"])<PAUSE_MAX_SEC and _n(m.get("pspeech",1))>=1),
 ]
 PIPELINE_VERSION="5.1-calibrated"
-STATS_CH=["smile","frown","browUp","browDown","eyeWide","blink","jawO","noseW","press","cheek","ocu","touch","twrist",
+STATS_CH=["smile","frown","browUp","browDown","eyeWide","blink","jawO","noseW","press","cheek","ocu","touch","twrist","wvis",
           "yaw","pitch","yc","pc","hand_speed","aperture","hfd","hfd2","tif","menergy","face_conf","pose_conf",
           "rms","f0","srate","pause"]
 
@@ -748,7 +753,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             smile=frown=browUp=browDown=eyeWide=blink=jawO=noseW=press=cheek=np.nan
             yaw=pitch=np.nan; hand_speed=np.nan; aperture=np.nan; hfd=np.nan; menergy=np.nan
             hfd2=np.nan; face_wn=np.nan; nose2n=None; face_box=None; tif=0.0; ocu=np.nan
-            touch=np.nan; twrist=np.nan; verts=None; iod=np.nan
+            touch=np.nan; twrist=np.nan; wvis=np.nan; verts=None; iod=np.nan
             a_rms=a_f0=np.nan; a_speech=0; a_srate=a_pause=np.nan; a_vemo=np.nan
             if audio is not None and idx<len(audio[0]):
                 a_rms=float(audio[0][idx]); a_f0=float(audio[1][idx])
@@ -807,10 +812,13 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
                     hfd=float(min(np.linalg.norm(w3l-head3),np.linalg.norm(w3r-head3))/sh3)
                 else:
                     hfd=np.nan
-                if verts is not None and iod>1e-6:
-                    # фолбэк-сигнал касания: запястье позы (детектируется надёжнее кисти)
+                # Фолбэк-сигнал касания — запястье позы. Считается ТОЛЬКО при достаточной видимости:
+                # когда рука вне кадра, Pose отдаёт правдоподобную, но неверную точку, и «касание»
+                # появлялось там, где ладоней в кадре нет (разбор ложных срабатываний на разметке).
+                if verts is not None and iod>1e-6 and vis_w>=TWRIST_MIN_VIS:
                     wp=np.array([[pl[15].x,pl[15].y],[pl[16].x,pl[16].y]],dtype=float)
                     twrist=min_dist_to_mesh(wp,verts)/iod
+                    wvis=vis_w
                 if prev_pose is not None: menergy=float(np.median(np.linalg.norm(pts-prev_pose,axis=1)))/scale
                 prev_pose=pts
             else: prev_pose=None
@@ -844,7 +852,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             pc=pitch-pm_ if not math.isnan(pitch) else np.nan
             rec={"t":round(real/fps,3),"face_conf":round(face_conf,3),"pose_conf":round(pose_conf,3),"hands":n_hands,"emotion":emotion,
                  **{k:round(float(v),4) if not (isinstance(v,float) and math.isnan(v)) else None for k,v in
-                    dict(smile=smile,frown=frown,browUp=browUp,browDown=browDown,eyeWide=eyeWide,blink=blink,jawO=jawO,noseW=noseW,press=press,cheek=cheek,ocu=ocu,touch=touch,twrist=twrist,
+                    dict(smile=smile,frown=frown,browUp=browUp,browDown=browDown,eyeWide=eyeWide,blink=blink,jawO=jawO,noseW=noseW,press=press,cheek=cheek,ocu=ocu,touch=touch,twrist=twrist,wvis=wvis,
                          yaw=yaw,pitch=pitch,yc=yc,pc=pc,hand_speed=hand_speed,aperture=aperture,hfd=hfd,hfd2=hfd2,tif=tif,menergy=menergy,
                          rms=a_rms,f0=a_f0,srate=a_srate,pause=a_pause,voicemo=a_vemo).items()}}
             rec={k:(v if v is not None else float("nan")) for k,v in rec.items()}

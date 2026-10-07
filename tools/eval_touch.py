@@ -36,6 +36,34 @@ def load_json(p: Path, default=None):
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+def gt_windows(gt, kind=None):
+    """Окна разметки как (t0,t1). kind: «touch» — реальное касание лица рукой, «near» — рука
+    проходит рядом без касания (поправляет волосы и т.п.), «negative» — заведомо не касание.
+    kind=None — все окна. Поддерживаются оба формата: [[a,b],…] и [{"t0","t1","kind"}…]."""
+    out = []
+    for w in gt.get("windows", []):
+        if isinstance(w, (list, tuple)):
+            k, a, b = "touch", float(w[0]), float(w[1])
+        else:
+            k, a, b = w.get("kind", "touch"), float(w["t0"]), float(w["t1"])
+        if kind is None or k == kind:
+            out.append((a, b))
+    return out
+
+
+def detections_in(det, windows):
+    """Сколько найденных эпизодов относится к указанным окнам: большая часть длительности
+    НАЙДЕННОГО эпизода лежит внутри окна. Критерий считается от найденного эпизода, а не от
+    ширины размеченного окна: разметка задана широкими «обёртками» (2–3 c), а детектор
+    выдаёт сам момент касания (0.5–1.5 c), поэтому порог «30 % окна» отбрасывал верные попадания."""
+    n = 0
+    for d in det:
+        dur = max(1e-6, d[1] - d[0])
+        if any(max(0.0, min(d[1], b) - max(d[0], a)) >= 0.5 * dur for a, b in windows):
+            n += 1
+    return n
+
+
 def spans_for(records, tau, twrist_tau, min_sec, gap_sec, fps_proc):
     """Локальная копия pipeline.touch_spans с произвольными порогами (для sweep)."""
     on = []
@@ -129,32 +157,45 @@ def evaluate(tau=None, twrist_tau=None, min_sec=None, gap_sec=None, verbose=True
             continue
         dur = recs[-1]["t"] - recs[0]["t"]
         fps_proc = (len(recs) - 1) / dur if dur > 0 else 1.0
-        gt_iv = [(a, b) for a, b in gt["windows"] if a <= recs[-1]["t"]]
+        gt_iv = [(a, b) for a, b in gt_windows(gt, "touch") if a <= recs[-1]["t"]]
+        near_iv = gt_windows(gt, "near")
+        neg_iv = gt_windows(gt, "negative")
         det_iv = to_intervals(recs, spans_for(recs, tau, twrist_tau, min_sec, gap_sec, fps_proc))
         tp, fp, fn, prec, rec, f1 = frame_scores(recs, det_iv, gt_iv, recs[-1]["t"])
-        pairs, miss_d, miss_g = match_episodes(det_iv, gt_iv)
-        e_prec = len(pairs) / len(det_iv) if det_iv else 0.0
-        e_rec = len(pairs) / len(gt_iv) if gt_iv else 0.0
+        # Эпизодная метрика: сколько НАЙДЕННЫХ эпизодов попало в разметку (precision) и сколько
+        # размеченных окон покрыто хотя бы одним найденным (recall). Сопоставление 1:1 здесь
+        # неверно: внутри одного размеченного окна может быть несколько реальных касаний.
+        hits = detections_in(det_iv, gt_iv)
+        covered = sum(1 for g in gt_iv if detections_in(det_iv, [g]) > 0)
+        e_prec = hits / len(det_iv) if det_iv else 0.0
+        e_rec = covered / len(gt_iv) if gt_iv else 0.0
         e_f1 = 2 * e_prec * e_rec / (e_prec + e_rec) if e_prec + e_rec else 0.0
+        near_det = detections_in(det_iv, near_iv)
+        neg_det = detections_in(det_iv, neg_iv)
         # «дробление»: сколько эпизодов найдено внутри каждого размеченного окна
-        splitting = {f"{a}-{b}": sum(1 for d in det_iv if overlap(d, (a, b)) > 0.3 * (b - a))
-                     for a, b in gt_iv if b - a >= 2.0}
+        splitting = {f"{a:g}-{b:g}": detections_in(det_iv, [(a, b)]) for a, b in gt_iv if b - a >= 2.0}
         if verbose:
             print(f"\n=== {fname} ({gt.get('label')}): {len(recs)} кадров, {recs[-1]['t']:.1f} c ===")
-            print(f"  разметка ({len(gt_iv)}): " + ", ".join(f"{a:g}-{b:g}" for a, b in gt_iv))
+            print(f"  разметка касаний ({len(gt_iv)}): " + ", ".join(f"{a:g}-{b:g}" for a, b in gt_iv))
+            if near_iv or neg_iv:
+                print(f"  фон разметки: «рука рядом» {len(near_iv)}, «заведомо не касание» {len(neg_iv)}")
             print(f"  найдено  ({len(det_iv)}): " + (", ".join(f"{a:.1f}-{b:.1f}" for a, b in det_iv) or "—"))
             print(f"  кадры: TP={tp} FP={fp} FN={fn} | precision={prec:.2f} recall={rec:.2f} F1={f1:.2f}")
-            print(f"  эпизоды: совпало {len(pairs)}/{len(gt_iv)} разметки, лишних {len(miss_d)}, "
-                  f"пропущено {len(miss_g)} | precision={e_prec:.2f} recall={e_rec:.2f} F1={e_f1:.2f}")
+            print(f"  эпизоды: в разметку попало {hits} из {len(det_iv)}, покрыто окон {covered} из {len(gt_iv)} "
+                  f"| precision={e_prec:.2f} recall={e_rec:.2f} F1={e_f1:.2f}")
+            if near_iv or neg_iv:
+                print(f"  из найденных: в окнах «рука рядом» {near_det}, в «заведомо не касание» {neg_det} "
+                      f"(для детектора КАСАНИЯ это ложные)")
             if splitting:
-                print("  эпизодов внутри окна: " + ", ".join(f"{k}: {v}" for k, v in splitting.items())
-                      + f" (ожидалось по разметке: {gt.get('expected_episodes')})")
+                print("  эпизодов внутри окна: " + ", ".join(f"{k}: {v}" for k, v in splitting.items()))
         rows.append({"video": fname, "frames": len(recs), "gt": gt_iv, "det": det_iv,
                      "frame": {"tp": tp, "fp": fp, "fn": fn, "precision": round(prec, 3),
                                "recall": round(rec, 3), "f1": round(f1, 3)},
-                     "episode": {"matched": len(pairs), "gt": len(gt_iv), "det": len(det_iv),
+                     "episode": {"hits": hits, "covered": covered, "gt": len(gt_iv), "det": len(det_iv),
                                  "precision": round(e_prec, 3), "recall": round(e_rec, 3),
                                  "f1": round(e_f1, 3)},
+                     "near_windows": len(near_iv), "near_detections": near_det,
+                     "negative_windows": len(neg_iv), "negative_detections": neg_det,
                      "splitting": splitting})
     if not rows:
         print("нет данных для оценки")
@@ -184,16 +225,23 @@ def windows_detail():
         recs = [json.loads(l) for l in
                 (ROOT / meta["dir"] / "metrics.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
         print(f"\n=== {fname} ===")
-        print(f"{'окно':>14} {'кадров':>7} {'touch есть':>11} {'touch p50':>10} {'twrist есть':>12} {'twrist p50':>11}")
-        for a, b in gt["windows"]:
+        print(f"{'окно':>14} {'тип':>9} {'кадров':>7} {'touch есть':>11} {'touch p50':>10} {'twrist есть':>12} {'twrist p50':>11}")
+        kinds = {}
+        for w in gt.get("windows", []):
+            if isinstance(w, (list, tuple)):
+                a, b, k = float(w[0]), float(w[1]), "touch"
+            else:
+                a, b, k = float(w["t0"]), float(w["t1"]), w.get("kind", "touch")
+            kinds[(a, b)] = k
+        for (a, b) in gt_windows(gt, None):
             win = [r for r in recs if a <= r["t"] <= b]
             if not win:
-                print(f"{f'{a:g}-{b:g}':>14} {'0':>7}  (вне проанализированного диапазона)")
+                print(f"{f'{a:g}-{b:g}':>14} {kinds.get((a,b),''):>9} {'0':>7}  (вне проанализированного диапазона)")
                 continue
             tt = [r["touch"] for r in win if r.get("touch") is not None]
             ww = [r["twrist"] for r in win if r.get("twrist") is not None]
             f = lambda v: f"{sorted(v)[len(v)//2]:.2f}" if v else "—"
-            print(f"{f'{a:g}-{b:g}':>14} {len(win):>7} {len(tt)/len(win)*100:>10.0f}% {f(tt):>10} "
+            print(f"{f'{a:g}-{b:g}':>14} {kinds.get((a,b),'touch'):>9} {len(win):>7} {len(tt)/len(win)*100:>10.0f}% {f(tt):>10} "
                   f"{len(ww)/len(win)*100:>11.0f}% {f(ww):>11}")
 
 
