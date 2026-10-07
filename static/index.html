@@ -525,9 +525,10 @@ $("#btnSearch").onclick=async()=>{ let target=SEARCH_VID||VID;
    $("#resList").innerHTML=(r.results||[]).map((x,i)=>`<div class="ep"><div class="b">#${i+1} <span class="tc">${fmt(x.t0)}–${fmt(x.t1)}</span><br>${x.pattern?`<span class="tag">${x.pattern}</span>`:""}distance: <b>${x.distance}</b>${x.face_touch_frac!=null?`<br><span class="tag">touch ${(x.face_touch_frac*100).toFixed(0)}%</span>`:""}<br>
     <button class="btn sec" onclick="jumpT(${x.t0})">▶ показать</button></div></div>`).join("")||"<span class='lbl'>ничего не найдено</span>";
    const m=r.meta||{};
-   const modeNote=m.mode==="free"?" (скользящее окно: эпизоды паттерна не сегментировались)":(m.total===0?" — эпизодов паттерна в этом видео нет":"");
-   const gateNote=m.face_touch_gate?` Строгий гейт касания лица АКТИВЕН${m.strict_face_touch?" + P06-эпизоды":""} (touch в окне слепка: ${Math.round((m.snapshot_touch_frac||0)*100)}%${m.note?"; "+m.note:""}).`:" Гейт касания лица не активен: в окне слепка мало подтверждённых касаний.";
-   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+". Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+modeNote+(ft?" Строгий режим касания лица включён.":"")+gateNote; }
+   const modeNote=m.mode==="free"?" (скользящее окно: эпизоды паттерна не сегментировались)":"";
+   const thrNote=m.match_threshold!=null?` Порог «совпадение/фон»: ${m.match_threshold} (по ${m.null_size} случайным окнам${m.dropped_below_threshold?`; отсеяно кандидатов: ${m.dropped_below_threshold}`:""}).`:"";
+   const gateNote=m.face_touch_gate?` Режим «касание лица» АКТИВЕН${m.strict_face_touch?` (кандидаты — эпизоды касания, всего в видео: ${m.touch_episodes_in_video!=null?m.touch_episodes_in_video:"—"})`:""} (доля касания в окне слепка: ${Math.round((m.snapshot_touch_frac||0)*100)}%${m.note?"; "+m.note:""}).`:" Гейт касания лица не активен: в окне слепка мало подтверждённых касаний.";
+   $("#resInfo").textContent="Паттерн поиска: "+(m.pattern||"—")+"."+(m.cross_video?" Поиск в другом видео: доли паттернов взяты из самого слепка.":"")+" Кандидатов: "+(m.total!=null?m.total:(r.results||[]).length)+"; показано: "+(r.results||[]).length+". Паттерны слепка: "+((m.patterns_in_snapshot||[]).join(", ")||"—")+"."+thrNote+modeNote+(ft?" Строгий режим касания лица включён.":"")+gateNote; }
   catch(e){ alert("Ошибка поиска: "+errText(e)); } };
 window.jumpT=t=>{ const sv=$("#searchVideo");
   if(SEARCH_VID && !$("#extCard").hidden){ sv.currentTime=t; sv.play(); }

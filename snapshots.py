@@ -1,12 +1,21 @@
-"""Цифровые слепки v5.0: корректная оцифровка жестового эпизода и поиск аналогий.
+"""Цифровые слепки v5.2: оцифровка жестового эпизода и поиск аналогий.
 Только измерения MediaPipe; LLM в этом контуре не участвует.
-Поиск строго соответствует конвейеру pipeline.PATTERN_DEFS (единый источник истины).
-search() возвращает (results, meta) — совместимо с app.py."""
+Поиск строго соответствует конвейеру pipeline.PATTERN_DEFS и pipeline.touch_* (единый источник истины).
+search() возвращает (results, meta) — совместимо с app.py.
+
+Изменения v5.2 (по итогам разметки владельца проекта):
+  * касание рукой лица считается геометрией «кисть -> меш лица» (pipeline.touch_frame),
+    а не AND из порогов по осям, который пропускал 1.13% кадров и давал 0 находок в строгом режиме;
+  * кандидаты строгого режима берутся из эпизодов касания, а не из маски P06;
+  * морфология формы кривой стала мягким штрафом вместо жёсткого отсева;
+  * при поиске в ДРУГОМ видео окно слепка не пересчитывается по таймкодам источника;
+  * добавлен порог «совпадение / фон» (нулевое распределение) — поиск умеет отвечать «не найдено».
+"""
 from __future__ import annotations
-import math, time, uuid
+import math, random, time, uuid, zlib
 import numpy as np
 
-SNAP_VERSION="5.0"
+SNAP_VERSION="5.2"
 DEFAULT_CHANNELS=["hand_speed","aperture","hfd","hfd2","yc","pc","menergy"]
 N=64
 MAX_EXT=1.5
@@ -17,14 +26,35 @@ MAX_EXT=1.5
 MAX_DUR_RATIO=2.0
 SPLICE_STEP_SEC=0.5
 SPLICE_MAX_SPANS=60
+# Мягкий штраф за несоответствие формы кривой (вместо жёсткого отсева кандидата)
+MORPH_PENALTY=0.6
+# Сколько случайных окон брать для нулевого распределения и какой его квантиль считать порогом.
+# 20-й процентиль выбран по разметке владельца проекта (tools/eval_search.py --grid):
+# precision 0.90 при recall вдвое выше, чем у 5-го процентиля.
+NULL_WINDOWS=120
+NULL_PERCENTILE=20.0
+# Каналы, которые сравниваются в абсолютных единицах (касание руки и лица), а не по форме
+_ABS_CHANNELS=("touch","twrist")
+# Минимальная доля кадров касания в окне слепка, чтобы считать слепок жестом «рука-лицо»
+SNAP_TOUCH_RATIO=0.30
+# Минимальная доля кадров касания в окне-кандидате (режим авто-касания)
+CAND_TOUCH_RATIO=0.15
 
 # Единый источник определений паттернов — pipeline.PATTERN_DEFS
 # (научно операционализированные пороги, Ekman/FACS, Kaitz 2007, Vismara 2016 и др.).
 # Локальные дубли-лямбды удалены: именно они считали NaN как "активно"
 # (r.get("hfd",1)<0.8 при пропущенном кадре давало ложные P02/P03/P06/P08/P11/P12)
 # и расходились с порогом P12 в конвейере (0.2 рад вместо radians(35)).
+# Оттуда же берутся геометрия касания и пороги: дублировать их нельзя (иначе слои разъедутся).
+_TOUCH_TAU=0.5; _TWRIST_TAU=2.6; _touch_spans=None; _touch_ratio=None; _touch_frame=None
 try:
     from pipeline import PATTERN_DEFS as _PD, _n as _pn, _nn as _pnn
+    try:
+        from pipeline import (touch_spans as _touch_spans, touch_ratio as _touch_ratio,
+                              touch_frame as _touch_frame,
+                              TOUCH_MAX_TAU as _TOUCH_TAU, TWRIST_MAX_TAU as _TWRIST_TAU)
+    except Exception:
+        pass
     PAT_IDS=[p[0] for p in _PD]
     PAT_DEFS=[(pid, lambda r, f=p[2]: bool(f({k:(np.nan if v is None else v)
                                                for k,v in r.items()})))
@@ -160,7 +190,28 @@ def _valid_channels(win,channels):
 
 def _series_of(win,c):
     v=np.array([r.get(c,float("nan")) for r in win],dtype=float)
+    # Каналы касания храним в АБСОЛЮТНЫХ единицах (межзрачковые расстояния): для жеста
+    # «рука у лица» важна реальная близость, а не форма нормированной кривой. Остальные
+    # каналы — как раньше, по форме (z-нормировка убирает масштаб и смещение).
+    if c in _ABS_CHANNELS:
+        return _resample(v)
     return _znorm(_resample(v))
+
+def _channel_distance(v,S_c,c):
+    """Расстояние по одному каналу между окном-кандидатом и эталоном слепка.
+
+    Для touch/twrist — RMSE в абсолютных единицах (в шаблоне они тоже лежат без нормировки),
+    для остальных каналов — 0.3*евклид + 0.7*DTW по z-нормированным кривым.
+    Раньше z-нормировались ВСЕ каналы, из-за чего «рука далеко» и «рука у лица» могли дать
+    одинаковую форму и попасть в результаты поиска.
+    """
+    if c in _ABS_CHANNELS:
+        cs=_resample(v); Sc=_resample(S_c)
+        if np.all(np.isnan(cs)) or np.all(np.isnan(Sc)):
+            return None
+        return float(np.sqrt(np.nanmean((cs-Sc)**2)))
+    cs=_znorm(_resample(v)); Sc=_znorm(_resample(S_c))
+    return 0.3*float(np.sqrt(np.mean((cs-Sc)**2)))+0.7*dtw_dist(cs,Sc)
 
 def create_snapshot(records,t0,t1,channels,name):
     idx=[i for i,r in enumerate(records) if t0<=r["t"]<=t1]
@@ -178,6 +229,13 @@ def create_snapshot(records,t0,t1,channels,name):
     frac={PAT_DEFS[k][0]:round(float(np.mean((pm>>k)&1==1)),3) for k in range(len(PAT_DEFS))}
     wm=0
     for k in act: wm|=(1<<k)
+    # Касание фиксируем прямо в слепке: при поиске в ЧУЖОМ видео это единственный корректный
+    # источник (таймкоды t0/t1 принадлежат источнику и в целевом видео ничего не значат).
+    dur_win=(win[-1]["t"]-win[0]["t"]) or 1.0
+    fps_win=(len(win)-1)/dur_win if dur_win>0 else 1.0
+    tsp=_touch_spans_or_none(win,fps_win) or []
+    touch_eps=[{"t0":round(win[a]["t"],2),"t1":round(win[b]["t"],2),"frames":b-a+1} for a,b in tsp]
+    touch_ratio_win=round(float(sum(b-a+1 for a,b in tsp)/max(1,len(win))),4)
     return {"id":uuid.uuid4().hex[:10],"name":name,"created":int(time.time()),
             "channels":chans,"duration":round(records[b0]["t"]-records[a0]["t"],2),
             "t0":round(records[a0]["t"],2),"t1":round(records[b0]["t"],2),
@@ -185,6 +243,8 @@ def create_snapshot(records,t0,t1,channels,name):
             "pattern_mask":wm,
             "pattern_active":[PAT_DEFS[x][0] for x in range(len(PAT_DEFS)) if wm&(1<<x)],
             "pattern_frac":{k:v for k,v in frac.items() if v>0},
+            "touch_ratio":touch_ratio_win,
+            "touch_episodes":touch_eps,
             "version":SNAP_VERSION}
 
 def _episodes_of_pattern(mask,b,fps_proc):
@@ -297,24 +357,79 @@ def _morph_ok(win,S_c,dur_s,fps_proc):
     return (d_euc<=1.7 and d_dtw<=1.35 and has_peak)
 
 def _face_touch_gate(r):
-    """Строгий кадр касания рукой лица (Kaitz 2007; Vismara 2016; Ekman FACS AU для рук).
-    Требует РЕАЛЬНО детектированную кисть И подтверждение близости к лицу НЕ МЕНЕЕ ДВУХ
-    независимых каналов одновременно: раньше достаточно было одного (например, ложного
-    tif=1 при проецировании запястья в бокс лица поверх одежды — «руки нет, а тач есть»).
-    Теперь: hands>0 + face_conf>=0.3 + минимум два из {tif, hfd<0.8, hfd2<0.55}."""
+    """Кадр касания рукой лица.
+
+    Единственная реализация — pipeline.touch_frame: геометрия «кисть -> меш лица» в единицах
+    межзрачкового расстояния, фолбэк по запястью позы и (для старых прогонов без каналов
+    касания) прежняя оценка по осям. Дублировать правило здесь нельзя: именно расхождение
+    копий порогов дало ситуацию, когда гейт пропускал 1.13% кадров и строгий режим
+    возвращал ноль находок, хотя кисть внутри окна касания видна в 95.7% кадров.
+    """
+    if _touch_frame is None:
+        return False
     try:
-        hands=float(r.get("hands") or 0)
+        return bool(_touch_frame(r))
     except Exception:
         return False
-    if hands<=0: return False
-    fc=r.get("face_conf")
-    if fc is not None and not _isnan(float(fc)) and float(fc)<0.3: return False
-    hfd=r.get("hfd"); hfd2=r.get("hfd2"); tif=r.get("tif")
-    signals=0
-    if tif is not None and not _isnan(float(tif)) and float(tif)>0.5: signals+=1
-    if hfd is not None and not _isnan(float(hfd)) and float(hfd)<0.8: signals+=1
-    if hfd2 is not None and not _isnan(float(hfd2)) and float(hfd2)<0.55: signals+=1
-    return signals>=2
+
+def _touch_spans_or_none(records,fps_proc):
+    """Эпизоды касания по данным конвейера (None, если каналов касания нет)."""
+    if _touch_spans is None:
+        return None
+    try:
+        return list(_touch_spans(records,fps_proc))
+    except Exception:
+        return None
+
+def _touch_ratio_of(records,fps_proc):
+    """Доля кадров в эпизодах касания; для легаси-данных — доля кадров, прошедших старый гейт."""
+    if _touch_ratio is not None:
+        try:
+            return float(_touch_ratio(records,fps_proc))
+        except Exception:
+            pass
+    if not records:
+        return 0.0
+    return sum(1 for r in records if _face_touch_gate(r))/len(records)
+
+def _null_distances(records,snap,chans,S,dur_s,fps_proc,n=NULL_WINDOWS):
+    """Нулевое распределение: расстояния «шаблон против случайного окна».
+
+    Нужно, чтобы отличать совпадение от фона. Раньше поиск всегда возвращал top-K, поэтому
+    на шуме интерфейс показывал K «находок» (владелец проекта видел ~22 ложных эпизода).
+    Длины окон берутся случайными в допустимом диапазоне (0.5x..2x слепка) и в расстояние
+    входит тот же штраф за длительность, что и у кандидатов — иначе сравнение нечестное.
+    Выборка детерминирована: seed из id слепка, повторный поиск даёт тот же порог.
+    """
+    total=len(records)
+    if total<8 or not chans:
+        return []
+    # Seed из СОДЕРЖИМОГО шаблона, а не из случайного id: одинаковый слепок даёт одинаковый
+    # порог, поэтому отчёты оценки воспроизводимы между запусками.
+    try:
+        seed=int(zlib.crc32(np.asarray(S[chans[0]],dtype=float).tobytes()))
+    except Exception:
+        seed=str(snap.get("id") or "seed")
+    rnd=random.Random(seed)
+    out=[]
+    for _ in range(max(10,int(n))):
+        ratio=1.0/MAX_DUR_RATIO + rnd.random()*(MAX_DUR_RATIO-1.0/MAX_DUR_RATIO)
+        W=max(3,int(round(dur_s*fps_proc*ratio)))
+        if total<=W+1: continue
+        s=rnd.randrange(0,total-W+1)
+        win=records[s:s+W]
+        dur_c=win[-1]["t"]-win[0]["t"]
+        if dur_c<=0: continue
+        pen=0.15*abs(math.log(dur_c/dur_s))
+        d=0.0; ok=0
+        for c in chans:
+            v=np.array([r.get(c,float("nan")) for r in win],dtype=float)
+            if len(v)==0 or np.all(np.isnan(v)): continue
+            cd=_channel_distance(v,S[c],c)
+            if cd is None: continue
+            d+=cd; ok+=1
+        if ok: out.append(d/ok+pen)
+    return out
 
 def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**kwargs):
     if not records: return [],{"total":0,"version":SNAP_VERSION}
@@ -330,39 +445,59 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
     mask=_pattern_mask(records)
     req=int(snap.get("pattern_mask",0) or 0)
     active=[x for x in range(len(PAT_DEFS)) if req&(1<<x)]
-    # Совместимость со слепками v4.0 (веер из-за bitwise-OR и NaN-дефолтов):
-    # пересчитываем активные паттерны по текущим определениям pipeline.
-    ra,br=_segment_bounds(records,snap.get("t0"),snap.get("t1"))
-    winmask=_pattern_mask(records[ra:br+1]) if ra is not None else _pattern_mask(records)
-    if len(active)>6 or not active:
+    # Ищем в том же видео, откуда взят слепок, или в другом? Таймкоды t0/t1 принадлежат
+    # ИСТОЧНИКУ: в чужом видео это произвольное место, поэтому окно по ним не пересчитывается
+    # (иначе целевой паттерн выбирался по случайному участку — владелец проекта получал
+    # поиск по P03 «движения головы» вместо касаний лица).
+    target_video=kwargs.get("target_video")
+    same_video = (target_video is None) or (snap.get("source_video") in (None,target_video))
+    # Доли паттернов в окне слепка: для чужого видео берём сохранённые при создании слепка
+    stored_frac={}
+    for _pid,_v in (snap.get("pattern_frac") or {}).items():
+        for _ix,_d in enumerate(PAT_DEFS):
+            if _d[0]==_pid and isinstance(_v,(int,float)):
+                stored_frac[_ix]=float(_v)
+    if same_video:
+        ra,br=_segment_bounds(records,snap.get("t0"),snap.get("t1"))
+        winmask=_pattern_mask(records[ra:br+1]) if ra is not None else _pattern_mask(records)
+        winfrac={x:float(np.mean((winmask>>x)&1==1)) for x in range(len(PAT_DEFS))}
+    else:
+        ra=br=None
+        winmask=_pattern_mask(records)
+        winfrac=dict(stored_frac)
+    if (len(active)>6 or not active) and same_video:
         # "веер" v4 или пустая маска: пересчитываем по текущим определениям
         active=_dominant_patterns(winmask)
-    # АВТОРЕЖИМ «касание лица» (исправление «находит эпизоды без рук/лица»):
-    # если в ОКНЕ САМОГО СЛЕПКА доля кадров с реальным touch-gate >= 30%, слепок
-    # семантически является жестом рука->лицо, и строгий P06-гейт включается
-    # автоматически — даже когда пользователь НЕ отметил чекбокс строгого режима.
+    elif not active:
+        active=_dominant_patterns(winmask)
+    # АВТОРЕЖИМ «касание лица»: если в ОКНЕ САМОГО СЛЕПКА заметная доля кадров — реальное
+    # касание, слепок семантически является жестом рука->лицо, и строгий режим включается сам.
+    # Для того же видео доля считается по кадрам, для чужого — берётся сохранённая в слепке.
     try:
-        wlen=max(1,(br-ra+1)) if ra is not None and br is not None else max(1,len(winmask))
-        wwin=records[ra:br+1] if ra is not None and br is not None else records
-        frac_touch=sum(1 for r in wwin if _face_touch_gate(r))/wlen
+        if not same_video:
+            frac_touch=float(snap.get("touch_ratio") or 0.0)
+        else:
+            wwin=records[ra:br+1] if ra is not None and br is not None else records
+            frac_touch=_touch_ratio_of(wwin,fps_proc)
     except Exception:
         frac_touch=0.0
-    snap_is_touch=frac_touch>=0.30
+    snap_is_touch=frac_touch>=SNAP_TOUCH_RATIO
     if snap_is_touch and not face_touch:
         face_touch=True
         meta_note="авто: окно слепка содержит >=30% кадров касания лица рукой"
     else:
         meta_note=""
     if snap_is_touch and not strict_ft:
-        # для корректной семантики жеста рука->лицо P06 обязателен и в слепке,
-        # иначе целевые окна без лица проходят по одному лишь морфологическому сходству кривой hfd
         strict_ft=True
     if pattern:
         sel=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]==pattern]
         if sel: active=sel
+    touch_spans_idx=[]
     if strict_ft:
-        # семантика запроса пользователя: искать ТОЛЬКО касания рукой лица (P06),
-        # независимо от маски слепка (в т.ч. старых v4.0 с "веером")
+        # Строгий режим ищет ТОЛЬКО касания рукой лица, поэтому кандидаты берутся из
+        # геометрических эпизодов касания (pipeline.touch_spans с теми же порогами, что в UI),
+        # а не из маски P06, построенной на порогах по осям.
+        touch_spans_idx=_touch_spans_or_none(records,fps_proc) or []
         p06=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]=="P06"]
         if p06: active=p06
     # ДОМИНИРУЮЩИЙ паттерн по всему видео: если в окне слепка активен «веер» из
@@ -385,8 +520,8 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         #    среди них — доминирующий по доле кадров окна слепка;
         # 2) если ни один не найден в видео — самый частотный в самом слепке
         #    (честно: показать, что аналогий нет, а не искать несуществующий P11).
-        frac={x:float(np.mean((winmask>>x)&1==1)) for x in active}
-        present=[x for x in active if len(_episodes_of_pattern(mask,x,fps_proc))>0]
+        frac={x:winfrac.get(x,0.0) for x in active}
+        present=[x for x in active if (strict_ft or len(_episodes_of_pattern(mask,x,fps_proc))>0)]
         if present:
             # face_touch: касание лица (P06) имеет наивысший приоритет семантики запроса
             ft=[x for x in present if PAT_DEFS[x][0]=="P06"]
@@ -414,10 +549,13 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         sel=[x for x in range(len(PAT_DEFS)) if PAT_DEFS[x][0]==pattern]
         if sel:
             b=sel[0]; pid=PAT_DEFS[b][0]
-            frac={x:float(np.mean((winmask>>x)&1==1)) for x in active}
-            frac[b]=float(np.mean((winmask>>b)&1==1)) if len(winmask) else 1.0
+            frac={x:winfrac.get(x,0.0) for x in active}
+            frac[b]=winfrac.get(b,0.0)
             active=[b]
     eps=_episodes_of_pattern(mask,b,fps_proc)
+    if strict_ft and touch_spans_idx:
+        # строгий режим: ищем именно геометрические эпизоды касания
+        eps=[tuple(x) for x in touch_spans_idx]
     if strict_ft:
         # в строгом режиме не скатываемся в free-скольжение: если P06-эпизодов нет,
         # честный ответ — 0 находок (а не шумовые окна без рук)
@@ -449,39 +587,62 @@ def search(records,snap,hop=None,top_k=100,refine=None,pattern=None,mode=None,**
         dur_c=T[bb]-T[a]
         if dur_c<=0: continue
         if dur_c>MAX_DUR_RATIO*dur_s: continue   # окно на всё видео не может быть совпадением слепка
-        # face_touch: хотя бы в 25% кадров окна реально детектирована кисть у лица
-        if face_touch:
-            ntouch=sum(1 for r in win if _face_touch_gate(r))
-            if ntouch < max(2,int(round(0.25*len(win)))): continue
+        # face_touch: в окне должен быть настоящий эпизод касания, а не 25% разрозненных кадров.
+        # В строгом режиме окна уже являются эпизодами касания — повторная проверка не нужна.
+        if face_touch and not strict_ft:
+            if _touch_spans_or_none(win,fps_proc) is None:
+                ntouch=sum(1 for r in win if _face_touch_gate(r))
+                if ntouch < max(2,int(round(0.25*len(win)))): continue
+            elif _touch_ratio_of(win,fps_proc) < CAND_TOUCH_RATIO:
+                continue
         pen=0.15*abs(math.log(dur_c/dur_s))
         d=0.0; ok=0; morph_fail=False
         for c in chans:
             v=np.array([r.get(c,float("nan")) for r in win],dtype=float)
             if len(v)==0 or np.all(np.isnan(v)): continue
-            cs=_znorm(_resample(v))
-            Sc=_znorm(_resample(S[c]))   # эталон слепка тоже к N точкам: иначе broadcast-краш
-            de=float(np.sqrt(np.mean((cs-Sc)**2)))
-            dd=dtw_dist(cs,Sc)
-            d+=0.3*de+0.7*dd; ok+=1
-            if not _morph_ok(v,Sc,dur_s,fps_proc): morph_fail=True
+            cd=_channel_distance(v,S[c],c)
+            if cd is None: continue
+            d+=cd; ok+=1
+            if not _morph_ok(v,_znorm(_resample(S[c])),dur_s,fps_proc): morph_fail=True
         if ok==0: continue
-        if face_touch and morph_fail: continue   # строгий режим: форма кривой обязательна
+        # Морфология формы — мягкий штраф вместо отсева: жёсткий AND (d_euc<=1.7 И d_dtw<=1.35
+        # И наличие пика) отбрасывал верные касания с более короткой или шумной кривой.
+        morph_pen=MORPH_PENALTY if (face_touch and morph_fail) else 0.0
         ft_frac=None
         if face_touch:
-            ft_frac=round(sum(1 for r in win if _face_touch_gate(r))/len(win),2)
+            ft_frac=round(_touch_ratio_of(win,fps_proc),2)
         item={"t0":round(T[a],2),"t1":round(T[bb],2),"frames":bb-a+1,
               "pattern":pid,"ep":k,"dur_ratio":round(dur_c/dur_s,2),
-              "distance":round(d/ok+pen,4)}
+              "distance":round(d/ok+pen+morph_pen,4)}
         if ft_frac is not None: item["face_touch_frac"]=ft_frac
         cands.append(item)
     cands.sort(key=lambda x:x["distance"])
-    keep=cands[:max(1,int(top_k))]
+    # Порог «совпадение / фон»: те же расстояния на случайных окнах этой же длины.
+    # Раньше всегда возвращался top-K, поэтому на шуме интерфейс показывал K «находок».
+    thr=None; null_n=0; dropped=0
+    if cands and kwargs.get("null_threshold",True):
+        null_d=_null_distances(records,snap,chans,S,dur_s,fps_proc)
+        if null_d:
+            null_n=len(null_d)
+            thr=float(np.percentile(null_d,float(kwargs.get("null_percentile",NULL_PERCENTILE))))
+            passed=[c for c in cands if c["distance"]<=thr]
+            dropped=len(cands)-len(passed)
+            cands=passed
+    keep=cands[:max(1,int(top_k))] if cands else []
     meta={"total":len(cands),"returned":len(keep),"version":SNAP_VERSION,"pattern":pid,
           "mode":mode,"episodes_of_pattern":len(eps),
           "patterns_in_snapshot":[PAT_DEFS[x][0] for x in range(len(PAT_DEFS)) if req&(1<<x)],
           "channels":chans,"snapshot_duration":dur_s,"max_dur_ratio":MAX_DUR_RATIO,
           "face_touch_gate":bool(face_touch),"strict_face_touch":bool(strict_ft),
-          "snapshot_touch_frac":round(float(frac_touch),2)}
+          "snapshot_touch_frac":round(float(frac_touch),2),
+          "cross_video":(not same_video),
+          "touch_max_tau":_TOUCH_TAU,"twrist_max_tau":_TWRIST_TAU,
+          "null_size":null_n,"match_threshold":(None if thr is None else round(thr,4)),
+          "dropped_below_threshold":dropped}
+    if strict_ft: meta["touch_episodes_in_video"]=len(touch_spans_idx)
+    if thr is not None and not keep:
+        meta["note"]=(meta.get("note","")+" " if meta.get("note") else "") + \
+            f"совпадений выше порога не найдено (порог {thr:.3f} по {null_n} случайным окнам)"
     if meta_note: meta["note"]=meta_note
     return keep,meta
 

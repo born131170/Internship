@@ -168,6 +168,81 @@ def ocu_from_landmarks(lm) -> float:
         vals.append(max(0.0, min(1.0, squeeze)))
     return sum(vals) / len(vals) if vals else float("nan")
 
+def min_dist_to_mesh(pts, verts) -> float:
+    """Минимальное расстояние от набора точек до вершин меша лица (для каждой точки — своя
+    ближайшая вершина). Геометрия вместо порогов по осям: две разные позы с одинаковыми
+    скалярами (tif/hfd) здесь различаются."""
+    p = np.asarray(pts, dtype=float); v = np.asarray(verts, dtype=float)
+    if p.size == 0 or v.size == 0:
+        return float("nan")
+    d = np.sqrt(((p[:, None, :] - v[None, :, :]) ** 2).sum(-1))
+    return float(d.min())
+
+def touch_frame(r) -> bool:
+    """Кадр касания лица рукой: расстояние «кисть -> ближайшая вершина меша лица» меньше
+    TOUCH_MAX_TAU в единицах межзрачкового расстояния. Если кисть не найдена (HandLandmarker
+    пропускает кадры), берётся фолбэк по запястью позы (TWRIST_MAX_TAU) — он грубее,
+    потому что запястье физически дальше кончиков пальцев.
+
+    Для записей без каналов касания (прогоны до v5.2) работает прежняя оценка по осям,
+    чтобы старые metrics.jsonl не превращались в «касаний нет вовсе»."""
+    t = r.get("touch")
+    if t is not None and not (isinstance(t, float) and math.isnan(t)):
+        return float(t) <= TOUCH_MAX_TAU
+    w = r.get("twrist")
+    if w is not None and not (isinstance(w, float) and math.isnan(w)):
+        return float(w) <= TWRIST_MAX_TAU
+    if r.get("touch") is not None or r.get("twrist") is not None:
+        return False        # каналы есть, но в этом кадре не измерены (нет кисти/лица)
+    try:
+        hands = float(r.get("hands") or 0)
+    except (TypeError, ValueError):
+        return False
+    if hands <= 0:
+        return False
+    fc = r.get("face_conf")
+    if fc is not None and not (isinstance(fc, float) and math.isnan(fc)) and float(fc) < 0.3:
+        return False
+    tif = r.get("tif"); hfd = r.get("hfd"); hfd2 = r.get("hfd2")
+    signals = 0
+    if tif is not None and not (isinstance(tif, float) and math.isnan(tif)) and float(tif) > 0.5: signals += 1
+    if hfd is not None and not (isinstance(hfd, float) and math.isnan(hfd)) and float(hfd) < 0.8: signals += 1
+    if hfd2 is not None and not (isinstance(hfd2, float) and math.isnan(hfd2)) and float(hfd2) < 0.55: signals += 1
+    return signals >= 2
+
+def touch_spans(records, fps_proc=None, min_sec=None, gap_sec=None):
+    """Индексы эпизодов касания лица рукой: склейка разрывов до gap_sec, отсев короче min_sec.
+
+    Возвращает список (a, b) — границы по кадрам. Единственное место, где касание
+    превращается в эпизод, поэтому конвейер, поиск и оценка качества считают одинаково."""
+    if not records:
+        return []
+    min_sec = TOUCH_MIN_SEC if min_sec is None else min_sec
+    gap_sec = TOUCH_GAP_SEC if gap_sec is None else gap_sec
+    if fps_proc is None:
+        dur = records[-1]["t"] - records[0]["t"]
+        fps_proc = (len(records) - 1) / dur if dur > 0 else 1.0
+    gap = max(1, int(round(gap_sec * fps_proc)))
+    min_len = max(1, int(round(min_sec * fps_proc)))
+    spans = []; st = None; last = None
+    for i, r in enumerate(records):
+        if touch_frame(r):
+            if st is None:
+                st = i
+            elif i - last > gap:
+                spans.append((st, last)); st = i
+            last = i
+    if st is not None:
+        spans.append((st, last))
+    return [(a, b) for a, b in spans if b - a + 1 >= min_len]
+
+def touch_ratio(records, fps_proc=None, min_sec=None, gap_sec=None) -> float:
+    """Доля кадров, входящих в эпизоды касания (одиночные шумовые кадры не считаются)."""
+    if not records:
+        return 0.0
+    inside = sum(b - a + 1 for a, b in touch_spans(records, fps_proc, min_sec, gap_sec))
+    return inside / len(records)
+
 # ---------------------------------------------------------------------------
 # Калибровка детекторов. Значения замерены на трёх референсных прогонах
 # (data/*/metrics.jsonl: 1153, 1304 и 1153 кадра) — обоснование уезжает в
@@ -182,6 +257,17 @@ PAUSE_CONTEXT_SEC = 5.0         # P14: сколько секунд после р
 BLINK_CLOSE_THR = 0.5           # P01: порог закрытия век
 BLINK_REFRACT_SEC = 0.2         # P01: рефрактерность между морганиями (Doughty 1989)
 
+# --- касание лица рукой: геометрия вместо порогов по осям ---
+# Единица измерения — межзрачковое расстояние (устойчиво к масштабу и положению в кадре).
+# Замер на ролике с известным окном касания (5357708274, 31-34 c): расстояние «кисть ->
+# ближайшая вершина меша лица» = 0.02-1.35 в окне и 0.48-1.68 на фоне; запястье позы даёт
+# 2.27-2.91 в окне и 2.73-10.8 на фоне (AUC 0.95). Кисть детектируется в 95.7% кадров
+# внутри окна касания против 6.4% вне него — терял не детектор, а старый AND из трёх порогов.
+TOUCH_MAX_TAU = 1.0      # кисть считается «у лица» (подобрано на разметке владельца, см. CALIBRATION)
+TWRIST_MAX_TAU = 2.6     # фолбэк по запястью позы, когда кисть не найдена
+TOUCH_MIN_SEC = 0.75     # короче — не эпизод касания (при stride=2 это ~3 кадра)
+TOUCH_GAP_SEC = 0.25     # разрыв, который ещё склеивается в один эпизод
+
 CALIBRATION = {
     "p12_gaze_avoidance_yaw_deg": GAZE_AVOIDANCE_YAW_DEG,
     "p12_note": ("только yaw, pitch исключён (кивок != отведение взгляда). На референсных видео порог 35° "
@@ -195,6 +281,19 @@ CALIBRATION = {
                  f"{PAUSE_CONTEXT_SEC} c назад); ранее тишина и видео без речи давали P14 на 46-94% кадров."),
     "p01_blink_thr": BLINK_CLOSE_THR,
     "p01_refractory_sec": BLINK_REFRACT_SEC,
+    "touch_max_tau": TOUCH_MAX_TAU,
+    "twrist_max_tau": TWRIST_MAX_TAU,
+    "touch_window_sec": [TOUCH_MIN_SEC, TOUCH_GAP_SEC],
+    "touch_note": ("касание = расстояние «кисть -> ближайшая вершина меша лица» <= touch_max_tau в единицах "
+                   "межзрачкового расстояния; если кисть не детектирована, фолбэк — запястье позы "
+                   "(twrist_max_tau). Раньше требовался hands>0 И два из {tif>0.5, hfd<0.8, hfd2<0.55}, "
+                   "что пропускало 1.13% кадров и давало ноль находок в строгом режиме."),
+    "touch_calibration": ("пороги подобраны перебором на разметке (video1: 0-2, 25-28, 74-77 c; video2: "
+                          "3.5-7.5, 12.5-15.5, 103-105, 119.5-121.5, 128-129, 132-132.5 c) скриптом "
+                          "tools/eval_touch.py --sweep: episode-level precision 0.83, recall 0.67, F1 0.73 "
+                          "против 0 находок у прежнего гейта. Часть пропусков — не порог, а отсутствие сигнала: "
+                          "кисть не детектирована в 40-85% кадров некоторых размеченных окон, а при stride=2 "
+                          "на видео 8 fps остаётся 4 кадра в секунду (касание 0.5 c = 1-2 кадра)."),
 }
 
 # Научно операционализированные паттерны (пороги — из литературы, см. psychometrics.NORM_SOURCES):
@@ -222,7 +321,7 @@ PATTERN_DEFS=[
     ("P14","Пауза в речи ≥0.5 c",  lambda m: PAUSE_MIN_SEC<=_n(m["pause"])<PAUSE_MAX_SEC and _n(m.get("pspeech",1))>=1),
 ]
 PIPELINE_VERSION="5.1-calibrated"
-STATS_CH=["smile","frown","browUp","browDown","eyeWide","blink","jawO","noseW","press","cheek","ocu",
+STATS_CH=["smile","frown","browUp","browDown","eyeWide","blink","jawO","noseW","press","cheek","ocu","touch","twrist",
           "yaw","pitch","yc","pc","hand_speed","aperture","hfd","hfd2","tif","menergy","face_conf","pose_conf",
           "rms","f0","srate","pause"]
 
@@ -649,6 +748,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             smile=frown=browUp=browDown=eyeWide=blink=jawO=noseW=press=cheek=np.nan
             yaw=pitch=np.nan; hand_speed=np.nan; aperture=np.nan; hfd=np.nan; menergy=np.nan
             hfd2=np.nan; face_wn=np.nan; nose2n=None; face_box=None; tif=0.0; ocu=np.nan
+            touch=np.nan; twrist=np.nan; verts=None; iod=np.nan
             a_rms=a_f0=np.nan; a_speech=0; a_srate=a_pause=np.nan; a_vemo=np.nan
             if audio is not None and idx<len(audio[0]):
                 a_rms=float(audio[0][idx]); a_f0=float(audio[1][idx])
@@ -665,6 +765,10 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
                          "o":[round(fl[263].x,4),round(fl[263].y,4)]}
                 ocu=ocu_from_landmarks(lm_pack)   # AU6: единая геометрическая оценка (см. P10D)
                 face_conf=float(np.mean([getattr(p,"visibility",1.0) or 1.0 for p in fl]))
+                # меш лица в нормированных координатах кадра + межзрачковое расстояние:
+                # база для геометрии касания (см. min_dist_to_mesh, touch_frame)
+                verts=np.array([[p.x,p.y] for p in fl],dtype=float)
+                iod=float(np.hypot(fl[33].x-fl[263].x, fl[33].y-fl[263].y))
                 for pt in fl: cv2.circle(right,(int(pt.x*w),int(pt.y*h)),1,(0,255,0),-1)
                 lm3=np.array([[p.x,p.y,p.z] for p in fl]); ctr=lm3.mean(0); f=lm3[1]-ctr
                 yaw=math.atan2(f[0],-f[2]+1e-9); pitch=math.atan2(f[1],-f[2]+1e-9)
@@ -703,6 +807,10 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
                     hfd=float(min(np.linalg.norm(w3l-head3),np.linalg.norm(w3r-head3))/sh3)
                 else:
                     hfd=np.nan
+                if verts is not None and iod>1e-6:
+                    # фолбэк-сигнал касания: запястье позы (детектируется надёжнее кисти)
+                    wp=np.array([[pl[15].x,pl[15].y],[pl[16].x,pl[16].y]],dtype=float)
+                    twrist=min_dist_to_mesh(wp,verts)/iod
                 if prev_pose is not None: menergy=float(np.median(np.linalg.norm(pts-prev_pose,axis=1)))/scale
                 prev_pose=pts
             else: prev_pose=None
@@ -721,6 +829,10 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
                 if face_box is not None:
                     x0f,y0f,x1f,y1f=face_box
                     tif=1.0 if any((hd[t].x>=x0f and hd[t].x<=x1f and hd[t].y>=y0f and hd[t].y<=y1f) for hd in hr.hand_landmarks for t in (4,8,12,16,20)) else 0.0
+                if verts is not None and iod>1e-6:
+                    # основной сигнал касания: все точки кистей против меша лица, в единицах МЗР
+                    hpts=np.array([[p.x,p.y] for hd in hr.hand_landmarks for p in hd],dtype=float)
+                    touch=min_dist_to_mesh(hpts,verts)/iod
                 for hd in hr.hand_landmarks:
                     hp=np.array([[p.x*w,p.y*h] for p in hd])
                     for a,b in HAND_LINKS: cv2.line(right,tuple(hp[a].astype(int)),tuple(hp[b].astype(int)),(255,0,255),1)
@@ -732,7 +844,7 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
             pc=pitch-pm_ if not math.isnan(pitch) else np.nan
             rec={"t":round(real/fps,3),"face_conf":round(face_conf,3),"pose_conf":round(pose_conf,3),"hands":n_hands,"emotion":emotion,
                  **{k:round(float(v),4) if not (isinstance(v,float) and math.isnan(v)) else None for k,v in
-                    dict(smile=smile,frown=frown,browUp=browUp,browDown=browDown,eyeWide=eyeWide,blink=blink,jawO=jawO,noseW=noseW,press=press,cheek=cheek,ocu=ocu,
+                    dict(smile=smile,frown=frown,browUp=browUp,browDown=browDown,eyeWide=eyeWide,blink=blink,jawO=jawO,noseW=noseW,press=press,cheek=cheek,ocu=ocu,touch=touch,twrist=twrist,
                          yaw=yaw,pitch=pitch,yc=yc,pc=pc,hand_speed=hand_speed,aperture=aperture,hfd=hfd,hfd2=hfd2,tif=tif,menergy=menergy,
                          rms=a_rms,f0=a_f0,srate=a_srate,pause=a_pause,voicemo=a_vemo).items()}}
             rec={k:(v if v is not None else float("nan")) for k,v in rec.items()}
@@ -839,10 +951,15 @@ def analyze_video(video: Path, out_dir: Path, stride=2, width=640, max_frames=0,
     method={"P06":"v4-final hybrid: (кончик пальца кисти внутри 2D-бокса лица x1.30 ИЛИ 3D-дистанция запястье->центр головы < 0.8 ширин плеч) AND кисть детектирована; без visibility-гейта; телефон у лица отсеивается",
             "P12":f"|yc| > {GAZE_AVOIDANCE_YAW_DEG:g}° от медианы видео (только yaw; pitch как кивок не учитывается)",
             "P14":f"пауза {PAUSE_MIN_SEC:g}-{PAUSE_MAX_SEC:g} c внутри речи (речь была не позже {PAUSE_CONTEXT_SEC:g} c назад)",
-            "P10D":f"smile>0.35 и AU6 = max(cheekRaise, геометрия глаза) > {DUCHENNE_AU6_MIN:g}"}
+            "P10D":f"smile>0.35 и AU6 = max(cheekRaise, геометрия глаза) > {DUCHENNE_AU6_MIN:g}",
+            "touch":f"касание лица рукой = «кисть -> меш лица» <= {TOUCH_MAX_TAU:g} МЗР (фолбэк: запястье позы <= {TWRIST_MAX_TAU:g}), эпизод от {TOUCH_MIN_SEC:g} c, склейка разрывов до {TOUCH_GAP_SEC:g} c"}
+    # эпизоды касания лица рукой — единый источник для UI, поиска и оценки качества
+    tspans=touch_spans(records,fps_proc)
+    touch_eps=[{"t0":round(records[a]["t"],2),"t1":round(records[b]["t"],2),"frames":b-a+1} for a,b in tspans]
     summary={"method":method,"calibration":CALIBRATION,"pipeline_version":PIPELINE_VERSION,"video":Path(video).name,"fps":fps,"n_frames":nf,"duration_sec":round(dur,1),
              "counters":counters,"events":events,"stats":stats,"emotions":emo_dist,
              "audio":audio_sum,"truth_cues":cues,"truth_heuristic":truth_score,
+             "touch_episodes":touch_eps,"touch_ratio":round(touch_ratio(records,fps_proc),4),
              "episodes":episodes,"pattern_names":{pid:nm for pid,nm,_ in PATTERN_DEFS},
              "personality":psych}
     (out_dir/"summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=1),encoding="utf-8")

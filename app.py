@@ -260,7 +260,8 @@ def search(vid: str, payload: dict):
         res,meta=snapshots.search(recs,snap,hop=float(payload.get("hop",0.25)),
                                   top_k=int(payload.get("top_k",100)),mode=mode,
                                   pattern=payload.get("pattern"),
-                                  face_touch=bool(payload.get("face_touch")))
+                                  face_touch=bool(payload.get("face_touch")),
+                                  target_video=vid)
         return {"snapshot":snap["id"],"results":res,"total":len(res),"meta":meta}
     except Exception as e:
         traceback.print_exc()

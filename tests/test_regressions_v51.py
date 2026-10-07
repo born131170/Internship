@@ -89,7 +89,7 @@ class TestSearchConcretization(unittest.TestCase):
     def test_search_returns_no_minute_long_window(self):
         """Слепок по «вездесущему» P07: раньше возвращалось одно окно на всё видео."""
         snap = snapshots.create_snapshot(self.recs, 12.5, 13.25, ["hand_speed"], "жест")
-        res, meta = snapshots.search(self.recs, snap, top_k=20)
+        res, meta = snapshots.search(self.recs, snap, top_k=20, null_threshold=False)
         self.assertTrue(res, "должны найтись кандидаты")
         dur_s = float(snap["duration"])
         for item in res:
@@ -107,7 +107,7 @@ class TestSearchConcretization(unittest.TestCase):
                                          ["tif", "hand_speed", "yc"], "рука-лицо")
         self.assertIn("P06", snap.get("pattern_active", []),
                       f"P06 должен доминировать в окне слепка: {snap.get('pattern_active')}")
-        res, meta = snapshots.search(self.recs, snap, top_k=20)
+        res, meta = snapshots.search(self.recs, snap, top_k=20, null_threshold=False)
         self.assertEqual(meta["pattern"], "P06",
                          f"целевой паттерн {meta['pattern']} вместо P06 (касание лица)")
         self.assertFalse(meta["face_touch_gate"],
